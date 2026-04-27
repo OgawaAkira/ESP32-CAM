@@ -1,0 +1,5 @@
+# Arquivos gerados pela compilação do Arduino
+build/
+*.bin
+*.elf
+*.hex
