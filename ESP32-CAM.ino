@@ -7,16 +7,110 @@
 #include <FS.h>
 #include "SD_MMC.h"
 
-const char* ssid = "Easylux";
-const char* password = "Easylux123!";
+const char* ssid = "ESP32_Camera";
+const char* password = "12345678"; 
 
 AsyncWebServer server(80);
-boolean takeNewPhoto = false;
+TaskHandle_t cameraTaskHandle = NULL;
 
-// Variável global para armazenar o número da próxima foto em RAM (MUITO MAIS RÁPIDO)
 int nextPhotoNumber = 1;
 
-// Pinos da Câmera
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset='UTF-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0'>
+<link rel='prefetch' href='/galeria'> 
+<style>
+body { text-align:center; font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color:#f4f4f9; margin:0; padding:30px 15px; color:#333; }
+h2 { color:#2c3e50; margin-bottom:30px; }
+button { background-color:#3498db; color:white; border:none; padding:18px 20px; font-size:18px; font-weight:bold; border-radius:10px; margin:10px 0; width:100%; max-width:320px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); cursor:pointer; transition:0.2s; }
+button:active { transform: scale(0.95); }
+button:disabled { background-color:#95a5a6; cursor:not-allowed; }
+.btn-galeria { background-color:#2ecc71; }
+</style></head><body>
+<h2>📷 Controle ESP32-CAM</h2>
+<button onclick="tirarFoto(this)">📸 TIRAR FOTO</button><br>
+<button class='btn-galeria' onclick="window.location.href='/galeria'">🖼️ VER GALERIA</button>
+<script>
+function tirarFoto(btn) {
+  btn.innerText = '⏳ Fotografando...';
+  btn.disabled = true;
+  fetch('/capture');
+  setTimeout(function(){ btn.innerText = '📸 TIRAR FOTO'; btn.disabled = false; }, 3500);
+}
+</script>
+</body></html>
+)rawliteral";
+
+const char galeria_header[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset='UTF-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0'>
+<style>
+body { font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align:center; background-color:#f4f4f9; margin:0; padding:20px 10px; color:#333; }
+a { color:#3498db; text-decoration:none; font-weight:bold; font-size:16px; }
+button { background-color:#e67e22; color:white; border:none; padding:15px; font-size:16px; font-weight:bold; border-radius:8px; margin:10px 0; width:100%; max-width:320px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); cursor:pointer; transition:0.2s; }
+button:active { transform: scale(0.95); }
+.btn-danger { background-color:#e74c3c; }
+.btn-danger-all { background-color:#c0392b; margin-top:20px; }
+.card { background:white; border-radius:10px; padding:15px; margin-bottom:20px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); width:100%; max-width:350px; box-sizing:border-box; }
+img { border-radius:8px; width:100%; height:auto; margin-top:10px; margin-bottom:10px; background-color:#ecf0f1; min-height:200px; display:flex; align-items:center; justify-content:center; color:#7f8c8d; font-size:14px; }
+.card-actions { display:flex; gap:10px; justify-content:space-between; }
+.card-actions a, .card-actions button { flex: 1; padding: 10px; font-size:14px; margin:0; }
+.card-actions a { background-color:#3498db; color:white; border-radius:8px; display:flex; align-items:center; justify-content:center; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+</style></head><body>
+<h2>🖼️ Sua Galeria</h2>
+<a href='/'>🔙 Voltar ao Menu</a><br>
+<button onclick='baixarTodas()'>📥 Baixar Todas as Fotos</button>
+<button class='btn-danger btn-danger-all' onclick='limparSD()'>🗑️ Apagar TODO o SD</button>
+<script>
+async function baixarTodas() {
+  let links = Array.from(document.querySelectorAll('.foto-link')).reverse();
+  if(links.length === 0) { alert('Nenhuma foto para baixar!'); return; }
+  
+  alert('Iniciando downloads em sequência... Por favor, não feche a página.');
+  
+  for (let link of links) {
+    let a = document.createElement('a'); 
+    a.href = link.href; 
+    a.download = link.dataset.filename;
+    document.body.appendChild(a); 
+    a.click(); 
+    document.body.removeChild(a);
+    
+    // Espera 1.5 segundos entre cada download para não sobrecarregar o ESP32
+    await new Promise(resolve => setTimeout(resolve, 1500)); 
+  }
+  alert('Comando de downloads finalizado!');
+}
+function apagarFoto(nome) {
+  if(confirm('Tem certeza que deseja apagar a ' + nome + '?')) {
+    fetch('/apagarfoto?nome=' + nome).then(res => { if(res.ok) { location.reload(); } else { alert('Erro ao apagar!'); } });
+  }
+}
+function limparSD() {
+  if(confirm('ATENÇÃO: Isso apagará TODAS AS FOTOS permanentemente! Deseja continuar?')) {
+    alert('Comando enviado! A limpeza pode levar alguns segundos. A página vai recarregar sozinha.');
+    fetch('/limparsd').then(() => { location.reload(); }).catch(() => { location.reload(); });
+  }
+}
+</script>
+<div style='display:flex; flex-direction:column; align-items:center;'>
+)rawliteral";
+
+const char galeria_footer[] PROGMEM = R"rawliteral(
+</div>
+<script>
+async function carregarFotos() {
+  let imgs = Array.from(document.querySelectorAll('img[data-src]')).reverse();
+  for(let img of imgs) {
+    await new Promise(resolve => {
+      img.onload = resolve; img.onerror = resolve; img.src = img.getAttribute('data-src');
+    });
+  }
+}
+window.onload = carregarFotos;
+</script></body></html>
+)rawliteral";
+
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
@@ -34,140 +128,198 @@ int nextPhotoNumber = 1;
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-// Função para descobrir qual a última foto salva ao ligar o ESP32
-void checkNextPhotoNumber() {
-  File root = SD_MMC.open("/");
-  File file = root.openNextFile();
-  int highestNumber = 0;
+void paginaInicial(AsyncWebServerRequest *request) {
+  AsyncWebServerResponse *response = request->beginResponse_P(200, "text/html", index_html);
+  response->addHeader("Cache-Control", "public, max-age=31536000"); 
+  request->send(response);
+}
+
+void rotaCapture(AsyncWebServerRequest *request) {
+  if(cameraTaskHandle != NULL) {
+    xTaskNotifyGive(cameraTaskHandle);
+  }
+  request->send(200, "text/plain", F("OK"));
+}
+
+void paginaGaleria(AsyncWebServerRequest *request) {
+  AsyncResponseStream *response = request->beginResponseStream("text/html");
+  response->print(FPSTR(galeria_header));
+
+  // Lógica de Paginação
+  int page = 0;
+  if(request->hasParam("page")) {
+    page = request->getParam("page")->value().toInt();
+  }
   
-  while(file){
-    String fileName = file.name();
-    if(fileName.indexOf("foto_") >= 0 && fileName.indexOf(".jpg") > 0){
-      // Extrai o número do nome do arquivo (ex: "foto_12.jpg" -> 12)
-      int startIndex = fileName.indexOf('_') + 1;
-      int endIndex = fileName.indexOf(".jpg");
-      int num = fileName.substring(startIndex, endIndex).toInt();
-      if(num > highestNumber) {
-        highestNumber = num;
+  int fotosPorPagina = 30;
+  int fotoInicial = (nextPhotoNumber - 1) - (page * fotosPorPagina);
+  int limite = fotoInicial - fotosPorPagina + 1; 
+  if (limite < 1) limite = 1;
+
+  bool temFoto = false;
+  char fileName[32];
+  char path[35];
+
+  if (fotoInicial >= 1) {
+    for(int i = fotoInicial; i >= limite; i--) {
+      snprintf(fileName, sizeof(fileName), "foto_%d.jpg", i);
+      snprintf(path, sizeof(path), "/%s", fileName);
+      
+      if(SD_MMC.exists(path)) {
+        temFoto = true;
+        response->print(F("<div class='card'>"));
+        response->printf("<img loading='lazy' data-src='/verfoto?nome=%s' alt='Carregando...'>", fileName);
+        response->print(F("<div class='card-actions'>"));
+        response->printf("<a class='foto-link' data-filename='%s' href='/baixarfoto?nome=%s'>📥 Baixar</a>", fileName, fileName);
+        response->printf("<button class='btn-danger' onclick=\"apagarFoto('%s')\">🗑️ Apagar</button>", fileName);
+        response->print(F("</div></div>"));
       }
     }
-    file = root.openNextFile();
   }
-  nextPhotoNumber = highestNumber + 1;
-  Serial.print("Próxima foto será a de número: ");
-  Serial.println(nextPhotoNumber);
+  
+  if(!temFoto) response->print(F("<p style='margin-top:20px; font-weight:bold;'>Nenhuma foto encontrada nesta página.</p>"));
+
+  // Botões de navegação
+  if (page > 0) {
+    response->printf("<button style='background-color:#34495e;' onclick=\"window.location.href='/galeria?page=%d'\">⬆️ Mais Recentes</button>", page - 1);
+  }
+  if (limite > 1) {
+    response->printf("<button style='background-color:#34495e;' onclick=\"window.location.href='/galeria?page=%d'\">⬇️ Mais Antigas</button>", page + 1);
+  }
+
+  response->print(FPSTR(galeria_footer));
+  request->send(response);
 }
 
-// ==========================================
-// PÁGINA INICIAL (Menu)
-// ==========================================
-void paginaInicial(AsyncWebServerRequest *request) {
-  String html = "<html><body style='text-align:center; font-family:Arial; margin-top:50px;'>";
-  html += "<h2>Controle ESP32-CAM</h2>";
-  html += "<button onclick=\"tirarFoto(this)\" style='padding:15px; font-size:18px; margin:10px; cursor:pointer;'>TIRAR FOTO</button><br>";
-  html += "<button onclick=\"window.location.href='/galeria'\" style='padding:15px; font-size:18px; margin:10px; cursor:pointer;'>VER GALERIA DE FOTOS</button>";
-  
-  html += "<script>";
-  html += "function tirarFoto(btn) {";
-  html += "  btn.innerText = 'Fotografando...';";
-  html += "  btn.disabled = true;";
-  html += "  fetch('/capture');";
-  html += "  setTimeout(function(){ btn.innerText = 'TIRAR FOTO'; btn.disabled = false; }, 1500);";
-  html += "}";
-  html += "</script>";
-  
-  html += "</body></html>";
-  request->send(200, "text/html", html);
-}
-
-// ==========================================
-// PÁGINA DA GALERIA (Carregamento em Fila)
-// ==========================================
-void paginaGaleria(AsyncWebServerRequest *request) {
-  String html = "<html><head><meta charset='UTF-8'></head><body style='font-family:Arial; text-align:center;'><h2>Sua Galeria</h2>";
-  html += "<a href='/'>[ Voltar ao Menu ]</a><br><br>";
-  
-  // Botão e Script para baixar todas as fotos
-  html += "<button onclick='baixarTodas()' style='padding:10px; font-size:16px; background-color:#4CAF50; color:white; border:none; cursor:pointer; margin-bottom:20px;'>Baixar Todas as Fotos</button><br>";
-  html += "<script>";
-  html += "function baixarTodas() {";
-  html += "  let links = document.querySelectorAll('.foto-link');";
-  html += "  let delay = 0;";
-  html += "  if(links.length === 0) { alert('Nenhuma foto para baixar!'); return; }";
-  html += "  alert('Iniciando download... Aguarde.');";
-  html += "  links.forEach(link => {";
-  html += "    setTimeout(() => {";
-  html += "      let a = document.createElement('a');";
-  html += "      a.href = link.href;";
-  html += "      a.download = link.innerText;";
-  html += "      document.body.appendChild(a);";
-  html += "      a.click();";
-  html += "      document.body.removeChild(a);";
-  html += "    }, delay);";
-  html += "    delay += 800;";
-  html += "  });";
-  html += "}";
-  html += "</script>";
-
-  File root = SD_MMC.open("/");
-  File file = root.openNextFile();
-  bool temFoto = false;
-  
-  while(file){
-    String fileName = file.name();
-    if(fileName.indexOf(".jpg") > 0){
-      temFoto = true;
-      html += "<div style='margin-bottom:20px; border:1px solid #ccc; padding:10px; display:inline-block;'>";
-      html += "<a class='foto-link' href='/baixarfoto?nome=" + fileName + "'>" + fileName + "</a><br><br>";
-      
-      // O TRUQUE ESTÁ AQUI: Trocamos 'src' por 'data-src'. O navegador não baixa na hora.
-      html += "<img data-src='/verfoto?nome=" + fileName + "' width='300' alt='Carregando foto...'>";
-      
-      html += "</div><br>";
+void rotaVerFoto(AsyncWebServerRequest *request) {
+  if (request->hasParam("nome")) {
+    String param = request->getParam("nome")->value(); 
+    
+    // TRAVA DE SEGURANÇA: Impede acesso a pastas superiores
+    if (param.indexOf("/") != -1 || param.indexOf("\\") != -1 || param.indexOf("..") != -1) {
+      request->send(400, "text/plain", F("Acesso negado"));
+      return;
     }
-    file = root.openNextFile();
+    
+    String fileName = "/" + param;
+    AsyncWebServerResponse *response = request->beginResponse(SD_MMC, fileName, "image/jpeg", false);
+    response->addHeader("Cache-Control", "public, max-age=31536000"); 
+    request->send(response);
+  } else {
+    request->send(400, "text/plain", F("Arquivo nao encontrado"));
+  }
+}
+
+void rotaBaixarFoto(AsyncWebServerRequest *request) {
+  if (request->hasParam("nome")) {
+    String param = request->getParam("nome")->value(); 
+    
+    // TRAVA DE SEGURANÇA
+    if (param.indexOf("/") != -1 || param.indexOf("\\") != -1 || param.indexOf("..") != -1) {
+      request->send(400, "text/plain", F("Acesso negado"));
+      return;
+    }
+    
+    String fileName = "/" + param;
+    // 'true' para forçar download e cabeçalho de 'attachment' restaurados
+    AsyncWebServerResponse *response = request->beginResponse(SD_MMC, fileName, "image/jpeg", true);
+    response->addHeader("Content-Disposition", "attachment; filename=\"" + fileName + "\"");
+    request->send(response);
+  } else {
+    request->send(400, "text/plain", F("Arquivo nao encontrado"));
+  }
+}
+
+void rotaApagarFoto(AsyncWebServerRequest *request) {
+  if (request->hasParam("nome")) {
+    String param = request->getParam("nome")->value(); 
+    
+    // TRAVA DE SEGURANÇA
+    if (param.indexOf("/") != -1 || param.indexOf("\\") != -1 || param.indexOf("..") != -1) {
+      request->send(400, "text/plain", F("Acesso negado"));
+      return;
+    }
+    
+    String fileName = "/" + param;
+    // Restaurada a função que realmente deleta a foto do SD
+    if (SD_MMC.remove(fileName)) {
+      request->send(200, "text/plain", F("Foto apagada"));
+    } else {
+      request->send(500, "text/plain", F("Erro ao apagar no SD"));
+    }
+  } else {
+    request->send(400, "text/plain", F("Arquivo nao encontrado"));
+  }
+}
+
+void rotaLimparSD(AsyncWebServerRequest *request) {
+  char filePath[32];
+  
+  // Apaga as fotos diretamente pelo índice - 100x mais rápido que varrer o diretório
+  // Varre até nextPhotoNumber + 50 como margem de segurança
+  int limiteBusca = nextPhotoNumber + 50; 
+  
+  for (int i = 1; i <= limiteBusca; i++) {
+    snprintf(filePath, sizeof(filePath), "/foto_%d.jpg", i);
+    if (SD_MMC.exists(filePath)) {
+      SD_MMC.remove(filePath);
+    }
   }
   
-  if(!temFoto) html += "<p>Nenhuma foto no cartao ainda.</p>";
-  
-  // SCRIPT MÁGICO: Baixa uma imagem de cada vez
-  html += "<script>";
-  html += "async function carregarFotos() {";
-  html += "  let imgs = document.querySelectorAll('img[data-src]');";
-  html += "  for(let img of imgs) {";
-  html += "    await new Promise(resolve => {";
-  html += "      img.onload = resolve;";   // Quando terminar de baixar, libera a próxima
-  html += "      img.onerror = resolve;";  // Se der erro, pula pra próxima
-  html += "      img.src = img.getAttribute('data-src');"; // Inicia o download desta
-  html += "    });";
-  html += "  }";
-  html += "}";
-  html += "window.onload = carregarFotos;"; // Roda assim que a página abre
-  html += "</script>";
+  SD_MMC.remove("/index.txt");
+  nextPhotoNumber = 1; 
+  request->send(200, "text/plain", F("SD Limpo"));
+}
 
-  html += "</body></html>";
-  request->send(200, "text/html", html);
+void rotaFavicon(AsyncWebServerRequest *request) {
+  request->send(204); 
+}
+
+void taskCamera(void * parameter) {
+  for(;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY); 
+    tirarFotoSalvarSD();
+  }
 }
 
 void setup() {
   Serial.begin(115200);
+  
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  btStop(); 
+  
+  pinMode(33, OUTPUT);
+  digitalWrite(33, HIGH); 
 
-  Serial.println("Criando rede Wi-Fi própria...");
-  WiFi.softAP("ESP32_Camera", "12345678"); // Nome da rede e senha (min 8 caracteres)
-  Serial.print("Conecte no Wi-Fi 'ESP32_Camera' e acesse o IP: ");
-  Serial.println(WiFi.softAPIP()); // O IP padrão será sempre 192.168.4.1
-
-  Serial.println("Inicializando SD Card...");
-  if (!SD_MMC.begin("/sdcard", true)) {
-    Serial.println("Falha no SD Card!");
-  } else {
-    // Lê o cartão SD apenas UMA VEZ na inicialização para achar o número da foto
-    checkNextPhotoNumber();
+  WiFi.softAP(ssid, password, 6, 0, 2);
+  WiFi.setSleep(false); 
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  
+  // Inicializa no modo 1-bit (true) e usa a velocidade máxima padrão (20MHz)
+  if (!SD_MMC.begin("/sdcard", true)) { 
+    Serial.println(F("Falha no SD"));
+    return; // É bom parar por aqui se o SD falhar
   }
 
-  Serial.print("Pronto! Digite no navegador: http://");
-  Serial.println(WiFi.softAPIP());
+  int maxNum = 1;
+  File indexFile = SD_MMC.open("/index.txt", FILE_READ);
+  if(indexFile) {
+    char buf[16];
+    size_t len = indexFile.read((uint8_t*)buf, sizeof(buf) - 1);
+    buf[len] = '\0';
+    maxNum = atoi(buf);
+    indexFile.close();
+  }
+  if (maxNum < 1) maxNum = 1;
+
+  char testPath[32];
+  snprintf(testPath, sizeof(testPath), "/foto_%d.jpg", maxNum);
+  while (SD_MMC.exists(testPath)) {
+    maxNum++;
+    snprintf(testPath, sizeof(testPath), "/foto_%d.jpg", maxNum);
+  }
+  
+  nextPhotoNumber = maxNum;
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -188,105 +340,66 @@ void setup() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = 20000000; 
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_VGA; 
-  config.jpeg_quality = 12; 
+  config.frame_size = FRAMESIZE_UXGA; 
+  config.jpeg_quality = 10; 
+  config.grab_mode = CAMERA_GRAB_LATEST; 
   
-  // AUMENTO DE VELOCIDADE AQUI: Se tiver PSRAM, usa 2 buffers
-  if(psramFound()){
-    config.fb_count = 2; // Permite capturar e processar ao mesmo tempo
-  } else {
-    config.fb_count = 1;
+  if(psramFound()) config.fb_count = 2; 
+  else config.fb_count = 1;
+
+  esp_camera_init(&config);
+
+  for (int i = 0; i < 3; i++) {
+    camera_fb_t * fb_dummy = esp_camera_fb_get();
+    if (fb_dummy) esp_camera_fb_return(fb_dummy);
+    vTaskDelay(200 / portTICK_PERIOD_MS);
   }
 
-  if (esp_camera_init(&config) != ESP_OK) {
-    Serial.println("Erro na camera!");
-    ESP.restart();
-  }
-
-  // ROTA 1: Página Inicial
   server.on("/", HTTP_GET, paginaInicial);
-
-  // ROTA 2: Comando para tirar a foto
-  server.on("/capture", HTTP_GET,[](AsyncWebServerRequest *request){
-    takeNewPhoto = true;
-    request->send(200, "text/plain", "OK");
-  });
-
-  // ROTA 3: Mostra a lista de fotos (Galeria + Função de Baixar Todas)
+  server.on("/capture", HTTP_GET, rotaCapture);
   server.on("/galeria", HTTP_GET, paginaGaleria);
+  server.on("/verfoto", HTTP_GET, rotaVerFoto);
+  server.on("/baixarfoto", HTTP_GET, rotaBaixarFoto);
+  server.on("/apagarfoto", HTTP_GET, rotaApagarFoto);
+  server.on("/limparsd", HTTP_GET, rotaLimparSD);
+  server.on("/favicon.ico", HTTP_GET, rotaFavicon); 
 
-  // ROTA 4: Ver a foto no navegador
-  server.on("/verfoto", HTTP_GET,[](AsyncWebServerRequest *request) {
-    if (request->hasParam("nome")) {
-      String fileName = "/" + request->getParam("nome")->value();
-      request->send(SD_MMC, fileName, "image/jpeg", false); // false = exibe no navegador
-    } else {
-      request->send(400, "text/plain", "Arquivo nao encontrado");
-    }
-  });
-
-  // ROTA 5: Baixar a foto como anexo (Download forçado)
-  server.on("/baixarfoto", HTTP_GET,[](AsyncWebServerRequest *request) {
-    if (request->hasParam("nome")) {
-      String fileName = "/" + request->getParam("nome")->value();
-      // O parâmetro 'true' no final cria o cabeçalho HTTP que obriga o navegador a fazer o download
-      AsyncWebServerResponse *response = request->beginResponse(SD_MMC, fileName, "image/jpeg", true);
-      request->send(response);
-    } else {
-      request->send(400, "text/plain", "Arquivo nao encontrado");
-    }
-  });
-
-  // Inicia o servidor web
+  DefaultHeaders::Instance().addHeader("Connection", "keep-alive");
   server.begin();
+  
+  xTaskCreatePinnedToCore(taskCamera, "CamTask", 8192, NULL, 3, &cameraTaskHandle, 1);
+  
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 1);
+  vTaskDelete(NULL); 
+} 
 
-  Serial.printf("Tamanho da PSRAM: %d bytes\n", ESP.getPsramSize());
+void loop() {}
 
-} // <--- FIM DO VOID SETUP()
-
-
-void loop() {
-  if (takeNewPhoto) {
-    tirarFotoSalvarSD();
-    takeNewPhoto = false;
-  }
-  delay(1);
-}
-
-// ==========================================
-// FUNÇÃO DE CAPTURA RÁPIDA DE FOTOS
-// ==========================================
 void tirarFotoSalvarSD() {
-  Serial.println("Tirando foto...");
+  digitalWrite(33, LOW); 
   camera_fb_t * fb = esp_camera_fb_get();
+  digitalWrite(33, HIGH); 
   
-  if (!fb) {
-    Serial.println("Falha na captura da camera");
-    return;
-  }
+  if (!fb) return;
 
-  // AQUI ESTÁ O SEGREDO DA VELOCIDADE:
-  // Em vez de varrer o cartão SD com um while(SD_MMC.exists), 
-  // usamos a variável nextPhotoNumber que está na memória RAM!
-  String caminho = "/foto_" + String(nextPhotoNumber) + ".jpg";
-  nextPhotoNumber++; // Já incrementa na RAM para a próxima vez
-
-  Serial.println("Salvando imagem como: " + caminho);
-
-  // Cria o arquivo com o novo nome gerado
+  char caminho[32]; 
+  snprintf(caminho, sizeof(caminho), "/foto_%d.jpg", nextPhotoNumber);
+  
   File file = SD_MMC.open(caminho, FILE_WRITE);
-
-  if (!file) {
-    Serial.println("Falha ao abrir o arquivo para escrita no Cartao SD");
-  } else {
+  if (file) {
     file.write(fb->buf, fb->len); 
-    Serial.print("Salvo com sucesso! Tamanho: ");
-    Serial.print(file.size());
-    Serial.println(" bytes");
-    file.close();
+    file.close(); 
+    
+    if (nextPhotoNumber == 1 || nextPhotoNumber % 10 == 0) {
+      File indexFile = SD_MMC.open("/index.txt", FILE_WRITE);
+      if(indexFile) {
+        indexFile.print(nextPhotoNumber);
+        indexFile.close();
+      }
+    }
+    nextPhotoNumber++;
   }
-  
   esp_camera_fb_return(fb);
 }
