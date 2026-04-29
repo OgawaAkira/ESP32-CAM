@@ -121,6 +121,7 @@ ESP32-CAM/
 ├── web_assets.h
 ├── README.md
 └── .gitignore
+```
 
 ### Descrição dos arquivos
 
