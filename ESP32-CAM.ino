@@ -1,6 +1,6 @@
 // ============================================================
 // ESP32-CAM — Servidor Web com Galeria e Captura para SD
-// Otimizado para menor consumo mantendo AP sempre ligado
+// Perfil: AP estável + preview rápida dedicada para tela principal
 // ============================================================
 
 #include <Arduino.h>
@@ -9,49 +9,95 @@
 #include "WiFi.h"
 #include "esp_wifi.h"
 #include "esp_camera.h"
-#include "esp_pm.h"
-#include "soc/soc.h"
-#include "soc/rtc_cntl_reg.h"
 #include <ESPAsyncWebServer.h>
 #include <FS.h>
 #include "SD_MMC.h"
 #include <DNSServer.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
 #include "config.h"
 #include "web_assets.h"
 
 // ============================================================
-// Variáveis globais
+// Globais
 // ============================================================
 static AsyncWebServer server(NetConfig::HTTP_PORT);
 static DNSServer      dnsServer;
-static TaskHandle_t   cameraTaskHandle = nullptr;
+static TaskHandle_t   cameraTaskHandle  = nullptr;
+static TaskHandle_t   clearSdTaskHandle = nullptr;
+
+static SemaphoreHandle_t sdMutex = nullptr;
 
 static std::atomic<int>      nextPhotoNumber{1};
-static std::atomic<bool>     camera_ocupada{false};
+static std::atomic<bool>     cameraOcupada{false};
 static std::atomic<bool>     cameraInicializada{false};
-static std::atomic<uint32_t> ultimoAcesso{0};
+static std::atomic<bool>     limpezaSD{false};
+static std::atomic<uint32_t> ultimoAcessoHttp{0};
+static std::atomic<uint32_t> ultimaAtividadeCamera{0};
 
 // ============================================================
 // Forward declarations
 // ============================================================
-static bool iniciarCamera();
-static void desligarCamera();
-static void tirarFotoSalvarSD();
-static void registrarAtividade();
+static void registrarAtividadeHttp();
+static void registrarAtividadeCamera();
 static bool nomeArquivoSeguro(const String& nome);
 static void responderErro(AsyncWebServerRequest* req, int code, const __FlashStringHelper* msg);
-static void servirArquivoSD(AsyncWebServerRequest* request, bool download);
-static void persistirIndiceFoto();
-static void aplicarOtimizacoesEnergia();
+
+static bool takeSdMutex(uint32_t timeoutMs = 2000);
+static void giveSdMutex();
+static bool persistirIndiceFotoLocked();
+
+static void setCpuFrequencySafe(uint32_t mhz);
+static void cpuModoOcioso();
+static void cpuModoAtivo();
+
+static void aplicarEstadoBaixoConsumoPins();
+static void energiaCamera(bool ligada);
+static bool iniciarCamera();
+static void desligarCamera();
+
 static bool inicializarSD();
+static bool gerarPreviewRapidoLocked();
+static bool encontrarUltimaFotoExistenteLocked(char* outPath, size_t outPathLen, int* outNum = nullptr);
+
+static void tirarFotoSalvarSD();
+static void taskCamera(void* parameter);
+static void taskLimparSD(void* parameter);
+
+static void aplicarWiFiPerfilEconomia();
+static void aplicarTxPowerSeguro();
+
+static void paginaInicial(AsyncWebServerRequest* request);
+static void paginaGaleria(AsyncWebServerRequest* request);
+
+static void rotaCapture(AsyncWebServerRequest* request);
+static void rotaStatus(AsyncWebServerRequest* request);
+static void rotaStatusCamera(AsyncWebServerRequest* request);
+static void rotaUltimaFoto(AsyncWebServerRequest* request);
+static void rotaPreviewPrincipal(AsyncWebServerRequest* request);
+static void servirArquivoSD(AsyncWebServerRequest* request, bool download);
+static void rotaVerFoto(AsyncWebServerRequest* r);
+static void rotaBaixarFoto(AsyncWebServerRequest* r);
+static void rotaApagarFoto(AsyncWebServerRequest* request);
+static void rotaLimparSD(AsyncWebServerRequest* request);
+static void rotaFavicon(AsyncWebServerRequest* request);
+
+static void responderPortalCativo(AsyncWebServerRequest* request);
+static void onNotFound(AsyncWebServerRequest* request);
 static void registrarRotas();
 
 // ============================================================
 // Utilitários
 // ============================================================
-static void registrarAtividade() {
-  ultimoAcesso.store(millis(), std::memory_order_relaxed);
+static void registrarAtividadeHttp() {
+  ultimoAcessoHttp.store(millis(), std::memory_order_relaxed);
+}
+
+static void registrarAtividadeCamera() {
+  ultimaAtividadeCamera.store(millis(), std::memory_order_relaxed);
 }
 
 static bool nomeArquivoSeguro(const String& nome) {
@@ -68,23 +114,147 @@ static inline void responderErro(AsyncWebServerRequest* req, int code,
   req->send(code, F("text/plain"), msg);
 }
 
-static void persistirIndiceFoto() {
+// ============================================================
+// Mutex do SD
+// ============================================================
+static bool takeSdMutex(uint32_t timeoutMs) {
+  if (!sdMutex) return false;
+  return xSemaphoreTake(sdMutex, pdMS_TO_TICKS(timeoutMs)) == pdTRUE;
+}
+
+static void giveSdMutex() {
+  if (sdMutex) xSemaphoreGive(sdMutex);
+}
+
+static bool persistirIndiceFotoLocked() {
+  if (SD_MMC.exists("/index.txt")) {
+    SD_MMC.remove("/index.txt");
+  }
+
   File indexFile = SD_MMC.open("/index.txt", FILE_WRITE);
   if (!indexFile) {
     log_w("Falha ao abrir /index.txt para escrita");
-    return;
+    return false;
   }
+
   indexFile.print(nextPhotoNumber.load());
   indexFile.close();
+  return true;
 }
 
 // ============================================================
-// Câmera — Inicialização e Desligamento
+// CPU
+// ============================================================
+static void setCpuFrequencySafe(uint32_t alvoMhz) {
+  const uint32_t atual = getCpuFrequencyMhz();
+  if (atual == alvoMhz) return;
+
+  if (atual == 240 && alvoMhz == 80) {
+    setCpuFrequencyMhz(160);
+    delay(1);
+    setCpuFrequencyMhz(80);
+    return;
+  }
+
+  if (atual == 80 && alvoMhz == 40) {
+    setCpuFrequencyMhz(40);
+    return;
+  }
+
+  if (atual == 40 && alvoMhz == 80) {
+    setCpuFrequencyMhz(80);
+    return;
+  }
+
+  setCpuFrequencyMhz(alvoMhz);
+}
+
+static void cpuModoOcioso() {
+  setCpuFrequencySafe(PowerConfig::CPU_IDLE_FREQ_MHZ);
+}
+
+static void cpuModoAtivo() {
+  setCpuFrequencySafe(PowerConfig::CPU_ACTIVE_FREQ_MHZ);
+}
+
+// ============================================================
+// Baixo consumo físico
+// ============================================================
+static void aplicarEstadoBaixoConsumoPins() {
+  pinMode(Pins::LED, OUTPUT);
+  digitalWrite(Pins::LED, HIGH);
+
+  pinMode(Pins::FLASH, OUTPUT);
+  digitalWrite(Pins::FLASH, LOW);
+
+  pinMode(Pins::PWDN, OUTPUT);
+  digitalWrite(Pins::PWDN, HIGH);
+
+  if (Pins::CAM_POWER_EN != -1) {
+    pinMode(Pins::CAM_POWER_EN, OUTPUT);
+    digitalWrite(Pins::CAM_POWER_EN,
+                 PowerConfig::CAM_POWER_EN_ACTIVE_HIGH ? LOW : HIGH);
+  }
+}
+
+static void energiaCamera(bool ligada) {
+  if (Pins::CAM_POWER_EN != -1) {
+    digitalWrite(Pins::CAM_POWER_EN,
+                 ligada == PowerConfig::CAM_POWER_EN_ACTIVE_HIGH ? HIGH : LOW);
+    delay(PowerConfig::CAM_POWER_SWITCH_DELAY_MS);
+  }
+
+  digitalWrite(Pins::PWDN, ligada ? LOW : HIGH);
+
+  if (!ligada) {
+    digitalWrite(Pins::FLASH, LOW);
+    digitalWrite(Pins::LED, HIGH);
+  }
+}
+
+// ============================================================
+// Wi-Fi
+// ============================================================
+static void aplicarTxPowerSeguro() {
+#if defined(WIFI_POWER_11dBm)
+  if (WiFi.setTxPower(WIFI_POWER_11dBm)) return;
+#endif
+#if defined(WIFI_POWER_13dBm)
+  if (WiFi.setTxPower(WIFI_POWER_13dBm)) return;
+#endif
+#if defined(WIFI_POWER_8_5dBm)
+  if (WiFi.setTxPower(WIFI_POWER_8_5dBm)) return;
+#endif
+#if defined(WIFI_POWER_7dBm)
+  if (WiFi.setTxPower(WIFI_POWER_7dBm)) return;
+#endif
+}
+
+static void aplicarWiFiPerfilEconomia() {
+  btStop();
+
+  if (NetConfig::TESTAR_WIFI_PS_EXPERIMENTAL_NO_AP) {
+    WiFi.setSleep(true);
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+  } else {
+    WiFi.setSleep(false);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+  }
+
+  aplicarTxPowerSeguro();
+}
+
+// ============================================================
+// Câmera
 // ============================================================
 static bool iniciarCamera() {
-  if (cameraInicializada.load()) return true;
+  if (cameraInicializada.load(std::memory_order_relaxed)) {
+    registrarAtividadeCamera();
+    return true;
+  }
 
-  digitalWrite(Pins::PWDN, LOW);
+  cpuModoAtivo();
+  energiaCamera(true);
   delay(10);
 
   camera_config_t config = {};
@@ -115,7 +285,7 @@ static bool iniciarCamera() {
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size   = CamConfig::FRAME_SIZE;
   config.jpeg_quality = CamConfig::JPEG_QUALITY;
-  config.grab_mode    = CAMERA_GRAB_LATEST;
+  config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_count     = 1;
 
   esp_err_t err = esp_camera_init(&config);
@@ -125,14 +295,16 @@ static bool iniciarCamera() {
   }
 
   if (err != ESP_OK) {
-    log_e("Falha init camera: 0x%x", err);
-    digitalWrite(Pins::PWDN, HIGH);
+    energiaCamera(false);
+    cameraInicializada.store(false, std::memory_order_relaxed);
+    cpuModoOcioso();
     return false;
   }
 
   sensor_t* s = esp_camera_sensor_get();
   if (s) {
-    // Pequenos ajustes que podem ajudar a estabilizar e evitar retrabalho
+    s->set_framesize(s, CamConfig::FRAME_SIZE);
+    s->set_quality(s, CamConfig::JPEG_QUALITY);
     s->set_brightness(s, 0);
     s->set_contrast(s, 0);
     s->set_saturation(s, 0);
@@ -141,64 +313,186 @@ static bool iniciarCamera() {
   for (uint8_t i = 0; i < CamConfig::WARMUP_FRAMES; ++i) {
     camera_fb_t* fb = esp_camera_fb_get();
     if (fb) esp_camera_fb_return(fb);
-    delay(60);
+    delay(CamConfig::WARMUP_DELAY_MS);
   }
 
-  cameraInicializada.store(true);
-  log_i("Camera inicializada");
+  cameraInicializada.store(true, std::memory_order_relaxed);
+  registrarAtividadeCamera();
   return true;
 }
 
 static void desligarCamera() {
-  if (!cameraInicializada.load()) return;
+  if (!cameraInicializada.load(std::memory_order_relaxed)) {
+    energiaCamera(false);
+    return;
+  }
 
   esp_camera_deinit();
-  digitalWrite(Pins::PWDN, HIGH);
-  cameraInicializada.store(false);
-  log_i("Camera desligada (economia)");
+  delay(5);
+  energiaCamera(false);
+  cameraInicializada.store(false, std::memory_order_relaxed);
 }
 
 // ============================================================
-// Captura e gravação no SD
+// SD / arquivos
+// ============================================================
+static bool encontrarUltimaFotoExistenteLocked(char* outPath, size_t outPathLen, int* outNum) {
+  int start = nextPhotoNumber.load(std::memory_order_relaxed) - 1;
+  if (start < 1) return false;
+
+  for (int i = start; i >= 1; --i) {
+    snprintf(outPath, outPathLen, "/foto_%d.jpg", i);
+    if (SD_MMC.exists(outPath)) {
+      if (outNum) *outNum = i;
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool inicializarSD() {
+  if (!SD_MMC.begin("/sdcard", true)) {
+    return false;
+  }
+
+  int maxNum = 1;
+
+  if (!takeSdMutex(3000)) {
+    return false;
+  }
+
+  File indexFile = SD_MMC.open("/index.txt", FILE_READ);
+  if (indexFile) {
+    char buf[16] = {0};
+    const size_t len = indexFile.read(reinterpret_cast<uint8_t*>(buf), sizeof(buf) - 1);
+    buf[len] = '\0';
+    maxNum = atoi(buf);
+    indexFile.close();
+  }
+
+  if (maxNum < 1) maxNum = 1;
+
+  char testPath[32];
+  snprintf(testPath, sizeof(testPath), "/foto_%d.jpg", maxNum);
+
+  while (SD_MMC.exists(testPath)) {
+    ++maxNum;
+    snprintf(testPath, sizeof(testPath), "/foto_%d.jpg", maxNum);
+  }
+
+  nextPhotoNumber.store(maxNum, std::memory_order_relaxed);
+  giveSdMutex();
+  return true;
+}
+
+// ============================================================
+// Preview rápida
+// ============================================================
+static bool gerarPreviewRapidoLocked() {
+  if (!PreviewConfig::ENABLE_PREVIEW_FILE) return true;
+
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) return false;
+
+  const framesize_t oldFrameSize = (framesize_t)s->status.framesize;
+  const int oldQuality = s->status.quality;
+
+  s->set_framesize(s, PreviewConfig::FRAME_SIZE);
+  s->set_quality(s, PreviewConfig::JPEG_QUALITY);
+  delay(PreviewConfig::SETTLE_DELAY_MS);
+
+  for (uint8_t i = 0; i < PreviewConfig::WARMUP_FRAMES; ++i) {
+    camera_fb_t* warm = esp_camera_fb_get();
+    if (warm) esp_camera_fb_return(warm);
+    delay(PreviewConfig::WARMUP_DELAY_MS);
+  }
+
+  camera_fb_t* fbPrev = esp_camera_fb_get();
+  if (!fbPrev) {
+    s->set_framesize(s, oldFrameSize);
+    s->set_quality(s, oldQuality);
+    return false;
+  }
+
+  if (SD_MMC.exists(PreviewConfig::FILE_PATH)) {
+    SD_MMC.remove(PreviewConfig::FILE_PATH);
+  }
+
+  File file = SD_MMC.open(PreviewConfig::FILE_PATH, FILE_WRITE);
+  bool ok = false;
+
+  if (file) {
+    const size_t written = file.write(fbPrev->buf, fbPrev->len);
+    file.close();
+    ok = (written == fbPrev->len);
+  }
+
+  if (!ok) {
+    SD_MMC.remove(PreviewConfig::FILE_PATH);
+  }
+
+  esp_camera_fb_return(fbPrev);
+
+  s->set_framesize(s, oldFrameSize);
+  s->set_quality(s, oldQuality);
+  delay(PreviewConfig::RESTORE_DELAY_MS);
+
+  return ok;
+}
+
+// ============================================================
+// Captura
 // ============================================================
 static void tirarFotoSalvarSD() {
-  registrarAtividade();
+  registrarAtividadeHttp();
+  registrarAtividadeCamera();
+  cpuModoAtivo();
 
   if (!iniciarCamera()) {
-    camera_ocupada.store(false);
+    cameraOcupada.store(false, std::memory_order_relaxed);
+    cpuModoOcioso();
     return;
   }
 
   if (!PowerConfig::DISABLE_STATUS_LED_DURING_CAPTURE) {
-    digitalWrite(Pins::LED, LOW);   // LED aceso (invertido)
+    digitalWrite(Pins::LED, LOW);
   }
 
   camera_fb_t* fb = esp_camera_fb_get();
 
   if (!PowerConfig::DISABLE_STATUS_LED_DURING_CAPTURE) {
-    digitalWrite(Pins::LED, HIGH);  // LED apagado
+    digitalWrite(Pins::LED, HIGH);
   }
 
   if (!fb) {
-    log_e("Falha ao capturar frame");
-    camera_ocupada.store(false);
-    if (PowerConfig::CAMERA_AUTO_SLEEP) desligarCamera();
+    cameraOcupada.store(false, std::memory_order_relaxed);
+    registrarAtividadeCamera();
+    cpuModoOcioso();
     return;
   }
 
   auto cleanup = [&]() {
-    esp_camera_fb_return(fb);
-    camera_ocupada.store(false);
-    if (PowerConfig::CAMERA_AUTO_SLEEP) desligarCamera();
+    if (fb) {
+      esp_camera_fb_return(fb);
+      fb = nullptr;
+    }
+    cameraOcupada.store(false, std::memory_order_relaxed);
+    registrarAtividadeCamera();
+    cpuModoOcioso();
   };
 
-  const int photoNum = nextPhotoNumber.load();
+  if (!takeSdMutex(6000)) {
+    cleanup();
+    return;
+  }
+
+  const int photoNum = nextPhotoNumber.load(std::memory_order_relaxed);
   char caminho[32];
   snprintf(caminho, sizeof(caminho), "/foto_%d.jpg", photoNum);
 
   File file = SD_MMC.open(caminho, FILE_WRITE);
   if (!file) {
-    log_e("Erro ao abrir %s", caminho);
+    giveSdMutex();
     cleanup();
     return;
   }
@@ -207,24 +501,29 @@ static void tirarFotoSalvarSD() {
   file.close();
 
   if (written != fb->len) {
-    log_e("Escrita incompleta: %u/%u", (unsigned)written, (unsigned)fb->len);
     SD_MMC.remove(caminho);
+    giveSdMutex();
     cleanup();
     return;
   }
 
-  nextPhotoNumber.store(photoNum + 1);
+  nextPhotoNumber.store(photoNum + 1, std::memory_order_relaxed);
 
   if (photoNum == 1 || (photoNum % GalleryConfig::SAVE_INDEX_INTERVAL) == 0) {
-    persistirIndiceFoto();
+    persistirIndiceFotoLocked();
   }
 
+  esp_camera_fb_return(fb);
+  fb = nullptr;
+
+  if (PreviewConfig::ENABLE_PREVIEW_FILE) {
+    gerarPreviewRapidoLocked();
+  }
+
+  giveSdMutex();
   cleanup();
 }
 
-// ============================================================
-// Task da câmera
-// ============================================================
 static void taskCamera(void* /*parameter*/) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -233,16 +532,64 @@ static void taskCamera(void* /*parameter*/) {
 }
 
 // ============================================================
-// Rotas — Páginas
+// Limpeza do SD
+// ============================================================
+static void taskLimparSD(void* /*parameter*/) {
+  cpuModoAtivo();
+  limpezaSD.store(true, std::memory_order_relaxed);
+
+  if (cameraInicializada.load(std::memory_order_relaxed) &&
+      !cameraOcupada.load(std::memory_order_relaxed)) {
+    desligarCamera();
+  }
+
+  if (!takeSdMutex(15000)) {
+    limpezaSD.store(false, std::memory_order_relaxed);
+    clearSdTaskHandle = nullptr;
+    cpuModoOcioso();
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  char filePath[32];
+  const int limite = nextPhotoNumber.load(std::memory_order_relaxed) + GalleryConfig::LIMITE_BUSCA_EXTRA;
+
+  for (int i = 1; i <= limite; ++i) {
+    snprintf(filePath, sizeof(filePath), "/foto_%d.jpg", i);
+    if (SD_MMC.exists(filePath)) {
+      SD_MMC.remove(filePath);
+    }
+    if ((i % 10) == 0) {
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+  }
+
+  if (SD_MMC.exists(PreviewConfig::FILE_PATH)) {
+    SD_MMC.remove(PreviewConfig::FILE_PATH);
+  }
+
+  SD_MMC.remove("/index.txt");
+  nextPhotoNumber.store(1, std::memory_order_relaxed);
+  persistirIndiceFotoLocked();
+  giveSdMutex();
+
+  limpezaSD.store(false, std::memory_order_relaxed);
+  clearSdTaskHandle = nullptr;
+  cpuModoOcioso();
+  vTaskDelete(nullptr);
+}
+
+// ============================================================
+// Páginas
 // ============================================================
 static void paginaInicial(AsyncWebServerRequest* request) {
-  registrarAtividade();
+  registrarAtividadeHttp();
   AsyncWebServerResponse* response = request->beginResponse_P(200, "text/html", index_html);
   request->send(response);
 }
 
 static void paginaGaleria(AsyncWebServerRequest* request) {
-  registrarAtividade();
+  registrarAtividadeHttp();
 
   AsyncResponseStream* response = request->beginResponseStream("text/html");
   response->print(FPSTR(galeria_header));
@@ -254,7 +601,7 @@ static void paginaGaleria(AsyncWebServerRequest* request) {
   }
 
   const int fotosPorPagina = GalleryConfig::FOTOS_POR_PAGINA;
-  const int totalFotos = nextPhotoNumber.load() - 1;
+  const int totalFotos = nextPhotoNumber.load(std::memory_order_relaxed) - 1;
 
   int fotoInicial = totalFotos - (page * fotosPorPagina);
   int limite      = fotoInicial - fotosPorPagina + 1;
@@ -265,45 +612,45 @@ static void paginaGaleria(AsyncWebServerRequest* request) {
   char path[35];
 
   if (fotoInicial >= 1) {
-    for (int i = fotoInicial; i >= limite; --i) {
-      snprintf(fileName, sizeof(fileName), "foto_%d.jpg", i);
-      snprintf(path, sizeof(path), "/%s", fileName);
+    if (takeSdMutex(3000)) {
+      for (int i = fotoInicial; i >= limite; --i) {
+        snprintf(fileName, sizeof(fileName), "foto_%d.jpg", i);
+        snprintf(path, sizeof(path), "/%s", fileName);
 
-      if (SD_MMC.exists(path)) {
-        temFoto = true;
-        response->print(F("<div class='card'>"));
-        response->printf(
-          "<img loading='lazy' data-src='/verfoto?nome=%s&t=%lu' alt='Carregando...'>",
-          fileName, (unsigned long)millis());
-        response->print(F("<div class='card-actions'>"));
-        response->printf(
-          "<a href='javascript:void(0)' class='foto-link' data-filename='%s' "
-          "data-href='/baixarfoto?nome=%s' onclick=\"baixarFoto('%s')\">📥 Baixar</a>",
-          fileName, fileName, fileName);
-        response->printf(
-          "<button class='btn-danger' onclick=\"confirmarApagarFoto('%s')\">🗑️ Apagar</button>",
-          fileName);
-        response->print(F("</div></div>"));
+        if (SD_MMC.exists(path)) {
+          temFoto = true;
+          response->print(F("<div class='card'>"));
+          response->printf(
+            "<img loading='lazy' data-src='/verfoto?nome=%s&t=%lu' alt='Carregando...'>",
+            fileName, (unsigned long)millis());
+          response->print(F("<div class='card-actions'>"));
+          response->printf(
+            "<a href='javascript:void(0)' class='foto-link' data-filename='%s' "
+            "data-href='/baixarfoto?nome=%s' onclick=\"baixarFoto('%s')\">📥 Baixar</a>",
+            fileName, fileName, fileName);
+          response->printf(
+            "<button class='btn-danger' onclick=\"confirmarApagarFoto('%s')\">🗑️ Apagar</button>",
+            fileName);
+          response->print(F("</div></div>"));
+        }
       }
+      giveSdMutex();
     }
   }
 
   if (!temFoto) {
-    response->print(F("<p style='margin-top:20px; font-weight:bold;'>"
-                      "Nenhuma foto encontrada nesta página.</p>"));
+    response->print(F("<p style='margin-top:20px; font-weight:bold;'>Nenhuma foto encontrada nesta página.</p>"));
   }
 
   if (page > 0) {
     response->printf(
-      "<button style='background-color:#34495e;' "
-      "onclick=\"window.location.href='/galeria?page=%d'\">⬆️ Mais Recentes</button>",
+      "<button style='background-color:#34495e;' onclick=\"window.location.href='/galeria?page=%d'\">⬆️ Mais Recentes</button>",
       page - 1);
   }
 
   if (limite > 1) {
     response->printf(
-      "<button style='background-color:#34495e;' "
-      "onclick=\"window.location.href='/galeria?page=%d'\">⬇️ Mais Antigas</button>",
+      "<button style='background-color:#34495e;' onclick=\"window.location.href='/galeria?page=%d'\">⬇️ Mais Antigas</button>",
       page + 1);
   }
 
@@ -312,12 +659,17 @@ static void paginaGaleria(AsyncWebServerRequest* request) {
 }
 
 // ============================================================
-// Rotas — API
+// API
 // ============================================================
 static void rotaCapture(AsyncWebServerRequest* request) {
-  registrarAtividade();
+  registrarAtividadeHttp();
 
-  if (camera_ocupada.exchange(true)) {
+  if (limpezaSD.load(std::memory_order_relaxed)) {
+    responderErro(request, 423, F("SD em limpeza"));
+    return;
+  }
+
+  if (cameraOcupada.exchange(true)) {
     responderErro(request, 429, F("Ocupada"));
     return;
   }
@@ -326,47 +678,80 @@ static void rotaCapture(AsyncWebServerRequest* request) {
     xTaskNotifyGive(cameraTaskHandle);
     request->send(200, F("text/plain"), F("OK"));
   } else {
-    camera_ocupada.store(false);
+    cameraOcupada.store(false, std::memory_order_relaxed);
     responderErro(request, 500, F("Task indisponivel"));
   }
 }
 
 static void rotaStatus(AsyncWebServerRequest* request) {
-  registrarAtividade();
+  registrarAtividadeHttp();
+
+  if (limpezaSD.load(std::memory_order_relaxed)) {
+    request->send(200, F("text/plain"), F("limpeza"));
+    return;
+  }
+
   request->send(200, F("text/plain"),
-                camera_ocupada.load() ? F("ocupada") : F("pronto"));
+                cameraOcupada.load(std::memory_order_relaxed) ? F("ocupada") : F("pronto"));
 }
 
 static void rotaStatusCamera(AsyncWebServerRequest* request) {
-  registrarAtividade();
+  registrarAtividadeHttp();
   request->send(200, F("text/plain"),
-                cameraInicializada.load() ? F("ativa") : F("economia"));
+                cameraInicializada.load(std::memory_order_relaxed) ? F("ativa") : F("economia"));
 }
 
 static void rotaUltimaFoto(AsyncWebServerRequest* request) {
-  registrarAtividade();
+  registrarAtividadeHttp();
 
-  const int ultima = nextPhotoNumber.load() - 1;
-  if (ultima < 1) {
-    responderErro(request, 404, F("Nenhuma foto"));
+  if (!takeSdMutex(3000)) {
+    responderErro(request, 503, F("SD ocupado"));
     return;
   }
 
   char fileName[32];
-  snprintf(fileName, sizeof(fileName), "/foto_%d.jpg", ultima);
+  const bool existe = encontrarUltimaFotoExistenteLocked(fileName, sizeof(fileName), nullptr);
+  giveSdMutex();
 
-  if (SD_MMC.exists(fileName)) {
+  if (!existe) {
+    responderErro(request, 404, F("Nenhuma foto"));
+    return;
+  }
+
+  AsyncWebServerResponse* response =
+      request->beginResponse(SD_MMC, fileName, "image/jpeg", false);
+
+  response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  request->send(response);
+}
+
+static void rotaPreviewPrincipal(AsyncWebServerRequest* request) {
+  registrarAtividadeHttp();
+
+  if (!takeSdMutex(3000)) {
+    responderErro(request, 503, F("SD ocupado"));
+    return;
+  }
+
+  bool existePreview = false;
+  if (PreviewConfig::ENABLE_PREVIEW_FILE) {
+    existePreview = SD_MMC.exists(PreviewConfig::FILE_PATH);
+  }
+  giveSdMutex();
+
+  if (existePreview) {
     AsyncWebServerResponse* response =
-        request->beginResponse(SD_MMC, fileName, "image/jpeg", false);
+        request->beginResponse(SD_MMC, PreviewConfig::FILE_PATH, "image/jpeg", false);
     response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     request->send(response);
-  } else {
-    responderErro(request, 404, F("Arquivo nao encontrado"));
+    return;
   }
+
+  rotaUltimaFoto(request);
 }
 
 static void servirArquivoSD(AsyncWebServerRequest* request, bool download) {
-  registrarAtividade();
+  registrarAtividadeHttp();
 
   if (!request->hasParam("nome")) {
     responderErro(request, 400, F("Parametro ausente"));
@@ -380,7 +765,16 @@ static void servirArquivoSD(AsyncWebServerRequest* request, bool download) {
   }
 
   const String fileName = "/" + param;
-  if (!SD_MMC.exists(fileName)) {
+
+  if (!takeSdMutex(3000)) {
+    responderErro(request, 503, F("SD ocupado"));
+    return;
+  }
+
+  const bool existe = SD_MMC.exists(fileName);
+  giveSdMutex();
+
+  if (!existe) {
     responderErro(request, 404, F("Arquivo nao encontrado"));
     return;
   }
@@ -402,7 +796,12 @@ static void rotaVerFoto(AsyncWebServerRequest* r)    { servirArquivoSD(r, false)
 static void rotaBaixarFoto(AsyncWebServerRequest* r) { servirArquivoSD(r, true);  }
 
 static void rotaApagarFoto(AsyncWebServerRequest* request) {
-  registrarAtividade();
+  registrarAtividadeHttp();
+
+  if (limpezaSD.load(std::memory_order_relaxed)) {
+    responderErro(request, 423, F("SD em limpeza"));
+    return;
+  }
 
   if (!request->hasParam("nome")) {
     responderErro(request, 400, F("Parametro ausente"));
@@ -415,8 +814,16 @@ static void rotaApagarFoto(AsyncWebServerRequest* request) {
     return;
   }
 
+  if (!takeSdMutex(4000)) {
+    responderErro(request, 503, F("SD ocupado"));
+    return;
+  }
+
   const String fileName = "/" + param;
-  if (SD_MMC.remove(fileName)) {
+  const bool ok = SD_MMC.remove(fileName);
+  giveSdMutex();
+
+  if (ok) {
     request->send(200, F("text/plain"), F("Foto apagada"));
   } else {
     responderErro(request, 500, F("Erro ao apagar"));
@@ -424,129 +831,70 @@ static void rotaApagarFoto(AsyncWebServerRequest* request) {
 }
 
 static void rotaLimparSD(AsyncWebServerRequest* request) {
-  registrarAtividade();
-  request->send(200, F("text/plain"), F("Limpeza iniciada"));
+  registrarAtividadeHttp();
 
-  xTaskCreate([](void*) {
-    char filePath[32];
-    const int limite = nextPhotoNumber.load() + GalleryConfig::LIMITE_BUSCA_EXTRA;
+  if (limpezaSD.load(std::memory_order_relaxed) || clearSdTaskHandle != nullptr) {
+    responderErro(request, 409, F("Limpeza ja em andamento"));
+    return;
+  }
 
-    for (int i = 1; i <= limite; ++i) {
-      snprintf(filePath, sizeof(filePath), "/foto_%d.jpg", i);
-      if (SD_MMC.exists(filePath)) {
-        SD_MMC.remove(filePath);
-      }
-      if (i % 10 == 0) {
-        vTaskDelay(pdMS_TO_TICKS(5));
-      }
-    }
+  if (cameraOcupada.load(std::memory_order_relaxed)) {
+    responderErro(request, 409, F("Camera ocupada"));
+    return;
+  }
 
-    SD_MMC.remove("/index.txt");
-    nextPhotoNumber.store(1);
-    persistirIndiceFoto();
-    log_i("SD limpo");
-    vTaskDelete(nullptr);
-  }, "ClearSD", 4096, nullptr, 1, nullptr);
+  BaseType_t ok = xTaskCreatePinnedToCore(
+    taskLimparSD,
+    "ClearSD",
+    4096,
+    nullptr,
+    1,
+    &clearSdTaskHandle,
+    1
+  );
+
+  if (ok == pdPASS) {
+    request->send(200, F("text/plain"), F("Limpeza iniciada"));
+  } else {
+    clearSdTaskHandle = nullptr;
+    responderErro(request, 500, F("Falha ao iniciar limpeza"));
+  }
 }
 
 static void rotaFavicon(AsyncWebServerRequest* request) {
-  registrarAtividade();
+  registrarAtividadeHttp();
   request->send(204);
 }
 
 // ============================================================
-// Captive Portal
+// Captive portal
 // ============================================================
 static void responderPortalCativo(AsyncWebServerRequest* request) {
-  registrarAtividade();
+  registrarAtividadeHttp();
   request->redirect("http://" + WiFi.softAPIP().toString() + "/");
 }
 
 static void onNotFound(AsyncWebServerRequest* request) {
-  registrarAtividade();
+  registrarAtividadeHttp();
   request->redirect("http://" + WiFi.softAPIP().toString() + "/");
 }
 
 // ============================================================
-// SD e índice inicial
-// ============================================================
-static bool inicializarSD() {
-  if (!SD_MMC.begin("/sdcard", true)) {
-    log_e("Falha ao montar SD");
-    return false;
-  }
-
-  int maxNum = 1;
-
-  File indexFile = SD_MMC.open("/index.txt", FILE_READ);
-  if (indexFile) {
-    char buf[16] = {0};
-    size_t len = indexFile.read(reinterpret_cast<uint8_t*>(buf), sizeof(buf) - 1);
-    buf[len] = '\0';
-    maxNum = atoi(buf);
-    indexFile.close();
-  }
-
-  if (maxNum < 1) maxNum = 1;
-
-  char testPath[32];
-  snprintf(testPath, sizeof(testPath), "/foto_%d.jpg", maxNum);
-
-  while (SD_MMC.exists(testPath)) {
-    ++maxNum;
-    snprintf(testPath, sizeof(testPath), "/foto_%d.jpg", maxNum);
-  }
-
-  nextPhotoNumber.store(maxNum);
-
-  log_i("Proximo numero de foto: %d", nextPhotoNumber.load());
-  return true;
-}
-
-// ============================================================
-// Economia de energia sem desligar AP
-// ============================================================
-static void aplicarOtimizacoesEnergia() {
-  setCpuFrequencyMhz(PowerConfig::CPU_FREQ_MHZ);
-
-  btStop();
-
-  if (NetConfig::WIFI_SLEEP_ENABLED) {
-    WiFi.setSleep(true);
-  } else {
-    WiFi.setSleep(false);
-  }
-
-  WiFi.setTxPower(NetConfig::TX_POWER);
-
-  // Tenta ativar modem sleep / power save no Wi-Fi
-  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-
-  // Configuração dinâmica de frequência (best effort)
-  esp_pm_config_esp32_t pm_config = {};
-  pm_config.max_freq_mhz = PowerConfig::CPU_FREQ_MHZ;
-  pm_config.min_freq_mhz = 40;
-  pm_config.light_sleep_enable = false; // AP contínuo: não usar light sleep aqui
-  esp_pm_configure(&pm_config);
-
-  log_i("Otimizacoes de energia aplicadas");
-}
-
-// ============================================================
-// Registro de rotas
+// Rotas
 // ============================================================
 static void registrarRotas() {
-  server.on("/",              HTTP_GET, paginaInicial);
-  server.on("/capture",       HTTP_GET, rotaCapture);
-  server.on("/status",        HTTP_GET, rotaStatus);
-  server.on("/status_camera", HTTP_GET, rotaStatusCamera);
-  server.on("/ultima_foto",   HTTP_GET, rotaUltimaFoto);
-  server.on("/galeria",       HTTP_GET, paginaGaleria);
-  server.on("/verfoto",       HTTP_GET, rotaVerFoto);
-  server.on("/baixarfoto",    HTTP_GET, rotaBaixarFoto);
-  server.on("/apagarfoto",    HTTP_GET, rotaApagarFoto);
-  server.on("/limparsd",      HTTP_GET, rotaLimparSD);
-  server.on("/favicon.ico",   HTTP_GET, rotaFavicon);
+  server.on("/",                  HTTP_GET, paginaInicial);
+  server.on("/capture",           HTTP_GET, rotaCapture);
+  server.on("/status",            HTTP_GET, rotaStatus);
+  server.on("/status_camera",     HTTP_GET, rotaStatusCamera);
+  server.on("/ultima_foto",       HTTP_GET, rotaUltimaFoto);
+  server.on("/preview_principal", HTTP_GET, rotaPreviewPrincipal);
+  server.on("/galeria",           HTTP_GET, paginaGaleria);
+  server.on("/verfoto",           HTTP_GET, rotaVerFoto);
+  server.on("/baixarfoto",        HTTP_GET, rotaBaixarFoto);
+  server.on("/apagarfoto",        HTTP_GET, rotaApagarFoto);
+  server.on("/limparsd",          HTTP_GET, rotaLimparSD);
+  server.on("/favicon.ico",       HTTP_GET, rotaFavicon);
 
   static const char* portalPaths[] = {
     "/generate_204", "/gen_204", "/fwlink",
@@ -568,50 +916,71 @@ static void registrarRotas() {
 // ============================================================
 void setup() {
   Serial.begin(115200);
-  delay(200);
+  delay(500);
 
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  aplicarEstadoBaixoConsumoPins();
 
-  // Pinos
-  pinMode(Pins::LED, OUTPUT);
-  digitalWrite(Pins::LED, HIGH);   // LED apagado (invertido)
-
-  pinMode(Pins::PWDN, OUTPUT);
-  digitalWrite(Pins::PWDN, HIGH);  // câmera desligada
-
-  pinMode(Pins::FLASH, OUTPUT);
-  digitalWrite(Pins::FLASH, PowerConfig::FORCE_FLASH_OFF ? LOW : LOW);
-
-  aplicarOtimizacoesEnergia();
-
-  // Wi-Fi Access Point sempre ativo
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(NetConfig::SSID, NetConfig::PASSWORD,
-              NetConfig::WIFI_CHANNEL, 0, NetConfig::MAX_CLIENTS);
-
-  dnsServer.start(NetConfig::DNS_PORT, "*", WiFi.softAPIP());
-
-  if (!inicializarSD()) {
-    log_e("Sistema sem SD — abortando");
+  sdMutex = xSemaphoreCreateMutex();
+  if (!sdMutex) {
     return;
   }
 
-  ultimoAcesso.store(millis());
-  cameraInicializada.store(false);
+  cpuModoAtivo();
+  delay(100);
 
-  DefaultHeaders::Instance().addHeader("Cache-Control",
-      "no-store, no-cache, must-revalidate, max-age=0");
+  WiFi.persistent(false);
+  WiFi.disconnect(true, true);
+  delay(200);
+
+  WiFi.mode(WIFI_OFF);
+  delay(200);
+
+  WiFi.mode(WIFI_AP);
+  delay(300);
+
+  bool apOk = WiFi.softAP(
+    NetConfig::SSID,
+    NetConfig::PASSWORD,
+    NetConfig::WIFI_CHANNEL,
+    0,
+    NetConfig::MAX_CLIENTS
+  );
+
+  if (!apOk) {
+    return;
+  }
+
+  aplicarWiFiPerfilEconomia();
+
+  IPAddress ip = WiFi.softAPIP();
+  dnsServer.start(NetConfig::DNS_PORT, "*", ip);
+
+  inicializarSD();
+
+  ultimoAcessoHttp.store(millis(), std::memory_order_relaxed);
+  ultimaAtividadeCamera.store(millis(), std::memory_order_relaxed);
+  cameraInicializada.store(false, std::memory_order_relaxed);
+
+  DefaultHeaders::Instance().addHeader(
+    "Cache-Control",
+    "no-store, no-cache, must-revalidate, max-age=0"
+  );
   DefaultHeaders::Instance().addHeader("Pragma", "no-cache");
 
   registrarRotas();
   server.begin();
 
-  xTaskCreatePinnedToCore(taskCamera, "CamTask", 8192,
-                          nullptr, 3, &cameraTaskHandle, 1);
+  xTaskCreatePinnedToCore(
+    taskCamera,
+    "CamTask",
+    8192,
+    nullptr,
+    3,
+    &cameraTaskHandle,
+    1
+  );
 
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 1);
-
-  log_i("Setup concluido. IP: %s", WiFi.softAPIP().toString().c_str());
+  cpuModoOcioso();
 }
 
 // ============================================================
@@ -623,12 +992,13 @@ void loop() {
   const uint32_t agora = millis();
 
   if (PowerConfig::CAMERA_AUTO_SLEEP &&
-      cameraInicializada.load() &&
-      !camera_ocupada.load() &&
-      (agora - ultimoAcesso.load() > CamConfig::SLEEP_TIMEOUT_MS)) {
+      cameraInicializada.load(std::memory_order_relaxed) &&
+      !cameraOcupada.load(std::memory_order_relaxed) &&
+      !limpezaSD.load(std::memory_order_relaxed) &&
+      (agora - ultimaAtividadeCamera.load(std::memory_order_relaxed) > CamConfig::SLEEP_TIMEOUT_MS)) {
     desligarCamera();
+    cpuModoOcioso();
   }
 
-  // Em vez de delay(), usa scheduler do FreeRTOS
   vTaskDelay(pdMS_TO_TICKS(CamConfig::LOOP_DELAY_MS));
 }

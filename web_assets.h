@@ -3,15 +3,12 @@
 
 #include <Arduino.h>
 
-// ============================================================
-// HTML PRINCIPAL
-// ============================================================
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html>
 <head>
 <meta charset='UTF-8'>
 <meta name='viewport' content='width=device-width, initial-scale=1.0'>
-<title>Minha Câmera ESP32</title>
+<title>Easylux Camera</title>
 <style>
 body { text-align:center; font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;
   background-color:#f4f4f9; margin:0; padding:30px 15px; color:#333; }
@@ -24,9 +21,9 @@ button:active { transform:scale(0.95); }
 button:disabled { background-color:#95a5a6; cursor:not-allowed; }
 .btn-galeria { background-color:#2ecc71; }
 .preview-container { margin-top:25px; display:none; flex-direction:column; align-items:center; }
-.preview-container img { max-width:100%; width:320px; border-radius:10px;
+.preview-container img { max-width:100%; width:260px; border-radius:10px;
   box-shadow:0 4px 8px rgba(0,0,0,0.2); background-color:#ecf0f1;
-  min-height:200px; transition:opacity 0.3s; }
+  min-height:140px; transition:opacity 0.25s; }
 .preview-title { font-weight:bold; color:#7f8c8d; margin-bottom:10px; font-size:14px; }
 .status-box { margin-top:14px; font-size:14px; color:#7f8c8d; font-weight:bold; }
 .toast { position:fixed; left:50%; bottom:20px; transform:translateX(-50%);
@@ -36,7 +33,7 @@ button:disabled { background-color:#95a5a6; cursor:not-allowed; }
 </style>
 </head>
 <body>
-<h2>📷 Controle ESP32-CAM</h2>
+<h2>📷 Easylux Camera</h2>
 <button onclick="tirarFoto(this)">📸 TIRAR FOTO</button><br>
 <button class='btn-galeria' onclick="window.location.href='/galeria'">🖼️ VER GALERIA</button>
 <div class="status-box" id="status-camera">Status: verificando...</div>
@@ -45,6 +42,7 @@ button:disabled { background-color:#95a5a6; cursor:not-allowed; }
   <img id="ultima-foto" alt="Carregando imagem...">
 </div>
 <div class="toast" id="toast"></div>
+
 <script>
 function showToast(msg, tempo = 2200) {
   const toast = document.getElementById('toast');
@@ -53,25 +51,33 @@ function showToast(msg, tempo = 2200) {
   clearTimeout(window.__toastTimer);
   window.__toastTimer = setTimeout(() => { toast.style.display = 'none'; }, tempo);
 }
+
 function atualizarStatusCamera() {
-  fetch('/status_camera?t=' + Date.now())
+  fetch('/status_camera?t=' + Date.now(), { cache: 'no-store' })
     .then(r => r.text())
     .then(txt => {
       const el = document.getElementById('status-camera');
-      if (txt === 'ativa') { el.innerText = 'Status: câmera ativa'; el.style.color = '#27ae60'; }
-      else { el.innerText = 'Status: modo economia'; el.style.color = '#7f8c8d'; }
+      if (txt === 'ativa') {
+        el.innerText = 'Status: câmera ativa';
+        el.style.color = '#27ae60';
+      } else {
+        el.innerText = 'Status: modo economia';
+        el.style.color = '#7f8c8d';
+      }
     }).catch(() => {});
 }
+
 function tirarFoto(btn) {
   btn.innerText = '⏳ Salvando SD...';
   btn.disabled = true;
-  let img = document.getElementById('ultima-foto');
-  let box = document.getElementById('preview-box');
-  if (img && box.style.display !== 'none') img.style.opacity = '0.3';
-  fetch('/capture?t=' + Date.now())
+
+  const img = document.getElementById('ultima-foto');
+  const box = document.getElementById('preview-box');
+  if (img && box.style.display !== 'none') img.style.opacity = '0.35';
+
+  fetch('/capture?t=' + Date.now(), { cache: 'no-store' })
     .then(r => {
       if (!r.ok) throw new Error();
-      atualizarStatusCamera();
       setTimeout(() => verificarStatus(btn), 120);
     })
     .catch(() => {
@@ -80,41 +86,55 @@ function tirarFoto(btn) {
       showToast('Erro ao iniciar captura.');
     });
 }
+
 function verificarStatus(btn) {
-  fetch('/status?t=' + Date.now())
+  fetch('/status?t=' + Date.now(), { cache: 'no-store' })
     .then(r => r.text())
     .then(estado => {
       if (estado === 'pronto') {
         btn.innerText = '📸 TIRAR FOTO';
         btn.disabled = false;
         atualizarPreview();
-        atualizarStatusCamera();
+        setTimeout(atualizarStatusCamera, 150);
         showToast('Foto salva com sucesso!');
-      } else { setTimeout(() => verificarStatus(btn), 120); }
+      } else if (estado === 'limpeza') {
+        btn.innerText = '📸 TIRAR FOTO';
+        btn.disabled = false;
+        showToast('SD em limpeza.');
+      } else {
+        setTimeout(() => verificarStatus(btn), 140);
+      }
     })
-    .catch(() => setTimeout(() => verificarStatus(btn), 150));
+    .catch(() => setTimeout(() => verificarStatus(btn), 180));
 }
+
 function atualizarPreview() {
-  let img = document.getElementById('ultima-foto');
-  let box = document.getElementById('preview-box');
+  const img = document.getElementById('ultima-foto');
+  const box = document.getElementById('preview-box');
+
   box.style.display = 'flex';
   img.style.opacity = '0.4';
   img.onload = () => { img.style.opacity = '1'; };
-  img.onerror = () => { box.style.display = 'none'; };
-  img.src = '/ultima_foto?t=' + Date.now();
+  img.onerror = () => {
+    img.onload = () => { img.style.opacity = '1'; };
+    img.onerror = () => { box.style.display = 'none'; };
+    img.src = '/ultima_foto?t=' + Date.now();
+  };
+  img.src = '/preview_principal?t=' + Date.now();
 }
+
 window.onload = function() {
   atualizarPreview();
-  atualizarStatusCamera();
-  setInterval(atualizarStatusCamera, 5000);
+  setTimeout(atualizarStatusCamera, 180);
+
+  setInterval(() => {
+    if (!document.hidden) atualizarStatusCamera();
+  }, 15000);
 };
 </script>
 </body></html>
 )rawliteral";
 
-// ============================================================
-// HTML GALERIA — Cabeçalho
-// ============================================================
 const char galeria_header[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html>
 <head>
@@ -136,7 +156,7 @@ button:disabled { background-color:#95a5a6; cursor:not-allowed; }
 .card { background:white; border-radius:10px; padding:15px; margin-bottom:20px;
   box-shadow:0 4px 8px rgba(0,0,0,0.1); width:100%; max-width:350px; box-sizing:border-box; }
 img { border-radius:8px; width:100%; height:auto; margin-top:10px; margin-bottom:10px;
-  background-color:#ecf0f1; min-height:200px; }
+  background-color:#ecf0f1; min-height:180px; }
 .card-actions { display:flex; gap:10px; justify-content:space-between; }
 .card-actions a, .card-actions button { flex:1; padding:10px; font-size:14px; margin:0; }
 .card-actions a { background-color:#3498db; color:white; border-radius:8px;
@@ -146,8 +166,7 @@ img { border-radius:8px; width:100%; height:auto; margin-top:10px; margin-bottom
   background:rgba(0,0,0,0.45); display:none; align-items:center;
   justify-content:center; z-index:9999; padding:12px; box-sizing:border-box; }
 .modal-box { background:white; width:100%; max-width:360px; border-radius:14px;
-  padding:22px 18px; box-shadow:0 8px 20px rgba(0,0,0,0.2);
-  animation:fadeInScale 0.25s ease; }
+  padding:22px 18px; box-shadow:0 8px 20px rgba(0,0,0,0.2); }
 .modal-title { font-size:20px; font-weight:bold; margin-bottom:10px; color:#2c3e50; }
 .modal-message { font-size:15px; color:#555; margin-bottom:18px; line-height:1.5; }
 .modal-actions { display:flex; gap:10px; justify-content:center; }
@@ -157,10 +176,6 @@ img { border-radius:8px; width:100%; height:auto; margin-top:10px; margin-bottom
   border-radius:10px; font-size:14px; box-shadow:0 6px 18px rgba(0,0,0,0.2);
   z-index:10000; display:none; max-width:90%; }
 .progress-box { margin-top:10px; font-size:14px; color:#7f8c8d; }
-@keyframes fadeInScale {
-  from { opacity:0; transform:scale(0.92); }
-  to { opacity:1; transform:scale(1); }
-}
 </style>
 </head>
 <body>
@@ -168,6 +183,7 @@ img { border-radius:8px; width:100%; height:auto; margin-top:10px; margin-bottom
 <a href='/'>🔙 Voltar ao Menu</a><br>
 <button id="btnBaixarTodas" onclick='baixarTodas()'>📥 Baixar Todas as Fotos</button>
 <button class='btn-danger btn-danger-all' onclick='confirmarLimparSD()'>🗑️ Apagar TODO o SD</button>
+
 <div class="modal-overlay" id="modalOverlay">
   <div class="modal-box">
     <div class="modal-title" id="modalTitle">Mensagem</div>
@@ -178,7 +194,9 @@ img { border-radius:8px; width:100%; height:auto; margin-top:10px; margin-bottom
     </div>
   </div>
 </div>
+
 <div class="toast" id="toast"></div>
+
 <script>
 function showToast(msg, tempo = 2200) {
   const toast = document.getElementById('toast');
@@ -204,13 +222,15 @@ function atualizarModalProgresso(txt) {
 }
 function fecharModal() { document.getElementById('modalOverlay').style.display = 'none'; }
 function confirmarAcao(titulo, mensagem, onConfirmJS) {
-  mostrarModal(titulo, mensagem,
+  mostrarModal(
+    titulo,
+    mensagem,
     '<button style="background:#95a5a6" onclick="fecharModal()">Cancelar</button>' +
-    '<button style="background:#e74c3c" onclick="' + onConfirmJS + '">Confirmar</button>');
+    '<button style="background:#e74c3c" onclick="' + onConfirmJS + '">Confirmar</button>'
+  );
 }
 function baixarFoto(nome) {
-  mostrarModal('Download iniciado',
-    'O navegador irá iniciar o download da foto. Em alguns celulares ela será salva automaticamente na pasta Downloads.',
+  mostrarModal('Download iniciado', 'O navegador irá iniciar o download da foto.',
     '<button onclick="fecharModal()">OK</button>');
   let a = document.createElement('a');
   a.href = '/baixarfoto?nome=' + encodeURIComponent(nome) + '&t=' + Date.now();
@@ -241,7 +261,7 @@ async function baixarTodas() {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    await new Promise(resolve => setTimeout(resolve, 1400));
+    await new Promise(resolve => setTimeout(resolve, 900));
   }
   atualizarModalProgresso('Concluído.');
   btn.disabled = false;
@@ -255,7 +275,7 @@ function confirmarApagarFoto(nome) {
 function executarApagarFoto(nome) {
   fecharModal();
   showToast('Apagando ' + nome + '...');
-  fetch('/apagarfoto?nome=' + encodeURIComponent(nome) + '&t=' + Date.now())
+  fetch('/apagarfoto?nome=' + encodeURIComponent(nome) + '&t=' + Date.now(), { cache: 'no-store' })
     .then(res => {
       if (res.ok) {
         showToast('Foto apagada com sucesso!');
@@ -273,8 +293,9 @@ function executarLimparSD() {
   fecharModal();
   mostrarModal('Limpando cartão', 'A limpeza foi iniciada. Aguarde alguns segundos...',
     '<button onclick="fecharModal()">Fechar</button>', 'Processando...');
-  fetch('/limparsd?t=' + Date.now())
-    .then(() => {
+  fetch('/limparsd?t=' + Date.now(), { cache: 'no-store' })
+    .then(r => {
+      if (!r.ok) throw new Error();
       atualizarModalProgresso('Concluído.');
       showToast('Cartão SD limpo com sucesso!');
       setTimeout(() => { window.location.href = '/galeria?t=' + Date.now(); }, 1200);
@@ -285,25 +306,25 @@ function executarLimparSD() {
 <div style='display:flex; flex-direction:column; align-items:center;'>
 )rawliteral";
 
-// ============================================================
-// HTML GALERIA — Rodapé
-// ============================================================
 const char galeria_footer[] PROGMEM = R"rawliteral(
 </div>
 <script>
-async function carregarFotos() {
-  let imgs = Array.from(document.querySelectorAll('img[data-src]'));
-  for (let img of imgs) {
-    await new Promise(resolve => {
+async function carregarFotosEmLotes(lote = 3) {
+  const imgs = Array.from(document.querySelectorAll('img[data-src]'));
+  for (let i = 0; i < imgs.length; i += lote) {
+    const grupo = imgs.slice(i, i + lote);
+    await Promise.all(grupo.map(img => new Promise(resolve => {
       img.onload = resolve;
       img.onerror = resolve;
       img.src = img.getAttribute('data-src');
-    });
+    })));
   }
 }
-window.onload = carregarFotos;
+window.onload = function() {
+  carregarFotosEmLotes(3);
+};
 </script>
 </body></html>
 )rawliteral";
 
-#endif // WEB_ASSETS_H
+#endif
