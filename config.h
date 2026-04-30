@@ -12,7 +12,7 @@ namespace NetConfig {
   constexpr const char* SSID         = "ESP32_Camera";
   constexpr const char* PASSWORD     = "12345678";
   constexpr uint8_t     WIFI_CHANNEL = 6;
-  constexpr uint8_t     MAX_CLIENTS  = 1;
+  constexpr uint8_t     MAX_CLIENTS  = 4;
   constexpr uint16_t    HTTP_PORT    = 80;
   constexpr uint16_t    DNS_PORT     = 53;
 
@@ -58,7 +58,7 @@ namespace GalleryConfig {
 }
 
 // ============================================================
-// Pinos ESP32-CAM (AI-Thinker)
+// Pinos ESP32-CAM AI-Thinker
 // ============================================================
 namespace Pins {
   constexpr int PWDN  = 32;
@@ -91,7 +91,6 @@ namespace PowerConfig {
   constexpr bool CAMERA_AUTO_SLEEP = true;
   constexpr bool FORCE_FLASH_OFF   = true;
 
-  constexpr uint8_t CPU_FREQ_MHZ        = 80;
   constexpr uint8_t CPU_IDLE_FREQ_MHZ   = 80;
   constexpr uint8_t CPU_ACTIVE_FREQ_MHZ = 80;
 

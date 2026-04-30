@@ -4,56 +4,93 @@
 #include <Arduino.h>
 
 const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE html><html>
+<!DOCTYPE html>
+<html>
 <head>
-<meta charset='UTF-8'>
-<meta name='viewport' content='width=device-width, initial-scale=1.0'>
-<title>Easylux Camera</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32 Camera</title>
 <style>
-body { text-align:center; font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;
-  background-color:#f4f4f9; margin:0; padding:30px 15px; color:#333; }
-h2 { color:#2c3e50; margin-bottom:30px; }
-button { background-color:#3498db; color:white; border:none; padding:18px 20px;
-  font-size:18px; font-weight:bold; border-radius:10px; margin:10px 0;
-  width:100%; max-width:320px; box-shadow:0 4px 6px rgba(0,0,0,0.1);
-  cursor:pointer; transition:0.2s; }
-button:active { transform:scale(0.95); }
-button:disabled { background-color:#95a5a6; cursor:not-allowed; }
-.btn-galeria { background-color:#2ecc71; }
-.preview-container { margin-top:25px; display:none; flex-direction:column; align-items:center; }
-.preview-container img { max-width:100%; width:260px; border-radius:10px;
-  box-shadow:0 4px 8px rgba(0,0,0,0.2); background-color:#ecf0f1;
-  min-height:140px; transition:opacity 0.25s; }
-.preview-title { font-weight:bold; color:#7f8c8d; margin-bottom:10px; font-size:14px; }
-.status-box { margin-top:14px; font-size:14px; color:#7f8c8d; font-weight:bold; }
-.toast { position:fixed; left:50%; bottom:20px; transform:translateX(-50%);
-  background:rgba(44,62,80,0.96); color:white; padding:14px 18px;
-  border-radius:10px; font-size:14px; box-shadow:0 6px 18px rgba(0,0,0,0.2);
-  z-index:9999; display:none; max-width:90%; }
+body {
+  text-align:center;
+  font-family:Arial, sans-serif;
+  background:#f4f4f9;
+  margin:0;
+  padding:25px 15px;
+  color:#333;
+}
+h2 { color:#2c3e50; }
+button {
+  background:#3498db;
+  color:white;
+  border:none;
+  padding:16px;
+  font-size:18px;
+  font-weight:bold;
+  border-radius:10px;
+  margin:10px 0;
+  width:100%;
+  max-width:320px;
+}
+button:disabled { background:#95a5a6; }
+.btn-galeria { background:#2ecc71; }
+.preview {
+  margin-top:20px;
+  display:none;
+  flex-direction:column;
+  align-items:center;
+}
+.preview img {
+  width:280px;
+  max-width:100%;
+  border-radius:10px;
+  background:#ddd;
+}
+.status {
+  margin-top:12px;
+  font-weight:bold;
+  color:#7f8c8d;
+}
+.toast {
+  position:fixed;
+  left:50%;
+  bottom:20px;
+  transform:translateX(-50%);
+  background:#2c3e50;
+  color:white;
+  padding:12px 16px;
+  border-radius:8px;
+  display:none;
+}
 </style>
 </head>
 <body>
-<h2>📷 Easylux Camera</h2>
-<button onclick="tirarFoto(this)">📸 TIRAR FOTO</button><br>
-<button class='btn-galeria' onclick="window.location.href='/galeria'">🖼️ VER GALERIA</button>
-<div class="status-box" id="status-camera">Status: verificando...</div>
-<div class="preview-container" id="preview-box">
-  <div class="preview-title">Visualização Rápida:</div>
-  <img id="ultima-foto" alt="Carregando imagem...">
+<h2>📷 ESP32 Camera</h2>
+
+<button onclick="tirarFoto(this)">📸 TIRAR FOTO</button>
+<br>
+<button class="btn-galeria" onclick="window.location.href='/galeria'">🖼️ GALERIA</button>
+
+<div class="status" id="status-camera">Status: verificando...</div>
+
+<div class="preview" id="preview-box">
+  <p><b>Última foto:</b></p>
+  <img id="ultima-foto">
 </div>
+
 <div class="toast" id="toast"></div>
 
 <script>
-function showToast(msg, tempo = 2200) {
-  const toast = document.getElementById('toast');
-  toast.innerText = msg;
-  toast.style.display = 'block';
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.innerText = msg;
+  t.style.display = 'block';
   clearTimeout(window.__toastTimer);
-  window.__toastTimer = setTimeout(() => { toast.style.display = 'none'; }, tempo);
+  window.__toastTimer = setTimeout(() => t.style.display = 'none', 2200);
 }
 
 function atualizarStatusCamera() {
-  fetch('/status_camera?t=' + Date.now(), { cache: 'no-store' })
+  fetch('/status_camera?t=' + Date.now(), {cache:'no-store'})
     .then(r => r.text())
     .then(txt => {
       const el = document.getElementById('status-camera');
@@ -64,267 +101,180 @@ function atualizarStatusCamera() {
         el.innerText = 'Status: modo economia';
         el.style.color = '#7f8c8d';
       }
-    }).catch(() => {});
+    });
+}
+
+function atualizarPreview() {
+  const box = document.getElementById('preview-box');
+  const img = document.getElementById('ultima-foto');
+
+  box.style.display = 'flex';
+  img.src = '/preview_principal?t=' + Date.now();
 }
 
 function tirarFoto(btn) {
-  btn.innerText = '⏳ Salvando SD...';
   btn.disabled = true;
+  btn.innerText = '⏳ Salvando...';
 
-  const img = document.getElementById('ultima-foto');
-  const box = document.getElementById('preview-box');
-  if (img && box.style.display !== 'none') img.style.opacity = '0.35';
-
-  fetch('/capture?t=' + Date.now(), { cache: 'no-store' })
+  fetch('/capture?t=' + Date.now(), {cache:'no-store'})
     .then(r => {
       if (!r.ok) throw new Error();
-      setTimeout(() => verificarStatus(btn), 120);
+      setTimeout(() => verificarStatus(btn), 150);
     })
     .catch(() => {
-      btn.innerText = '📸 TIRAR FOTO';
       btn.disabled = false;
-      showToast('Erro ao iniciar captura.');
+      btn.innerText = '📸 TIRAR FOTO';
+      toast('Erro ao iniciar captura');
     });
 }
 
 function verificarStatus(btn) {
-  fetch('/status?t=' + Date.now(), { cache: 'no-store' })
+  fetch('/status?t=' + Date.now(), {cache:'no-store'})
     .then(r => r.text())
-    .then(estado => {
-      if (estado === 'pronto') {
-        btn.innerText = '📸 TIRAR FOTO';
+    .then(txt => {
+      if (txt === 'pronto') {
         btn.disabled = false;
+        btn.innerText = '📸 TIRAR FOTO';
         atualizarPreview();
-        setTimeout(atualizarStatusCamera, 150);
-        showToast('Foto salva com sucesso!');
-      } else if (estado === 'limpeza') {
-        btn.innerText = '📸 TIRAR FOTO';
+        atualizarStatusCamera();
+        toast('Foto salva');
+      } else if (txt === 'limpeza') {
         btn.disabled = false;
-        showToast('SD em limpeza.');
+        btn.innerText = '📸 TIRAR FOTO';
+        toast('SD em limpeza');
       } else {
-        setTimeout(() => verificarStatus(btn), 140);
+        setTimeout(() => verificarStatus(btn), 150);
       }
     })
-    .catch(() => setTimeout(() => verificarStatus(btn), 180));
-}
-
-function atualizarPreview() {
-  const img = document.getElementById('ultima-foto');
-  const box = document.getElementById('preview-box');
-
-  box.style.display = 'flex';
-  img.style.opacity = '0.4';
-  img.onload = () => { img.style.opacity = '1'; };
-  img.onerror = () => {
-    img.onload = () => { img.style.opacity = '1'; };
-    img.onerror = () => { box.style.display = 'none'; };
-    img.src = '/ultima_foto?t=' + Date.now();
-  };
-  img.src = '/preview_principal?t=' + Date.now();
+    .catch(() => setTimeout(() => verificarStatus(btn), 200));
 }
 
 window.onload = function() {
   atualizarPreview();
-  setTimeout(atualizarStatusCamera, 180);
-
-  setInterval(() => {
-    if (!document.hidden) atualizarStatusCamera();
-  }, 15000);
+  atualizarStatusCamera();
 };
 </script>
-</body></html>
+</body>
+</html>
 )rawliteral";
 
 const char galeria_header[] PROGMEM = R"rawliteral(
-<!DOCTYPE html><html>
+<!DOCTYPE html>
+<html>
 <head>
-<meta charset='UTF-8'>
-<meta name='viewport' content='width=device-width, initial-scale=1.0'>
-<title>Galeria de Fotos</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Galeria</title>
 <style>
-body { font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif; text-align:center;
-  background-color:#f4f4f9; margin:0; padding:20px 10px; color:#333; }
-a { color:#3498db; text-decoration:none; font-weight:bold; font-size:16px; }
-button { background-color:#e67e22; color:white; border:none; padding:15px;
-  font-size:16px; font-weight:bold; border-radius:8px; margin:10px 0;
-  width:100%; max-width:320px; box-shadow:0 4px 6px rgba(0,0,0,0.1);
-  cursor:pointer; transition:0.2s; }
-button:active { transform:scale(0.95); }
-button:disabled { background-color:#95a5a6; cursor:not-allowed; }
-.btn-danger { background-color:#e74c3c; }
-.btn-danger-all { background-color:#c0392b; margin-top:20px; }
-.card { background:white; border-radius:10px; padding:15px; margin-bottom:20px;
-  box-shadow:0 4px 8px rgba(0,0,0,0.1); width:100%; max-width:350px; box-sizing:border-box; }
-img { border-radius:8px; width:100%; height:auto; margin-top:10px; margin-bottom:10px;
-  background-color:#ecf0f1; min-height:180px; }
-.card-actions { display:flex; gap:10px; justify-content:space-between; }
-.card-actions a, .card-actions button { flex:1; padding:10px; font-size:14px; margin:0; }
-.card-actions a { background-color:#3498db; color:white; border-radius:8px;
-  display:flex; align-items:center; justify-content:center;
-  box-shadow:0 4px 6px rgba(0,0,0,0.1); }
-.modal-overlay { position:fixed; top:0; left:0; width:100%; height:100%;
-  background:rgba(0,0,0,0.45); display:none; align-items:center;
-  justify-content:center; z-index:9999; padding:12px; box-sizing:border-box; }
-.modal-box { background:white; width:100%; max-width:360px; border-radius:14px;
-  padding:22px 18px; box-shadow:0 8px 20px rgba(0,0,0,0.2); }
-.modal-title { font-size:20px; font-weight:bold; margin-bottom:10px; color:#2c3e50; }
-.modal-message { font-size:15px; color:#555; margin-bottom:18px; line-height:1.5; }
-.modal-actions { display:flex; gap:10px; justify-content:center; }
-.modal-actions button { flex:1; max-width:140px; margin:0; }
-.toast { position:fixed; left:50%; bottom:20px; transform:translateX(-50%);
-  background:rgba(44,62,80,0.96); color:white; padding:14px 18px;
-  border-radius:10px; font-size:14px; box-shadow:0 6px 18px rgba(0,0,0,0.2);
-  z-index:10000; display:none; max-width:90%; }
-.progress-box { margin-top:10px; font-size:14px; color:#7f8c8d; }
+body {
+  text-align:center;
+  font-family:Arial, sans-serif;
+  background:#f4f4f9;
+  margin:0;
+  padding:20px 10px;
+}
+a {
+  color:#3498db;
+  font-weight:bold;
+  text-decoration:none;
+}
+button {
+  background:#e67e22;
+  color:white;
+  border:none;
+  padding:14px;
+  font-size:16px;
+  font-weight:bold;
+  border-radius:8px;
+  margin:8px 0;
+  width:100%;
+  max-width:320px;
+}
+.btn-danger { background:#e74c3c; }
+.card {
+  background:white;
+  border-radius:10px;
+  padding:12px;
+  margin:15px auto;
+  max-width:350px;
+  box-shadow:0 4px 8px rgba(0,0,0,0.1);
+}
+.card img {
+  width:100%;
+  border-radius:8px;
+  background:#ddd;
+}
+.actions {
+  display:flex;
+  gap:8px;
+}
+.actions a,
+.actions button {
+  flex:1;
+  font-size:14px;
+  padding:10px;
+}
+.actions a {
+  background:#3498db;
+  color:white;
+  border-radius:8px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+}
 </style>
 </head>
 <body>
-<h2>🖼️ Sua Galeria</h2>
-<a href='/'>🔙 Voltar ao Menu</a><br>
-<button id="btnBaixarTodas" onclick='baixarTodas()'>📥 Baixar Todas as Fotos</button>
-<button class='btn-danger btn-danger-all' onclick='confirmarLimparSD()'>🗑️ Apagar TODO o SD</button>
-
-<div class="modal-overlay" id="modalOverlay">
-  <div class="modal-box">
-    <div class="modal-title" id="modalTitle">Mensagem</div>
-    <div class="modal-message" id="modalMessage">Texto</div>
-    <div class="progress-box" id="modalProgress" style="display:none;"></div>
-    <div class="modal-actions" id="modalActions">
-      <button onclick="fecharModal()">OK</button>
-    </div>
-  </div>
-</div>
-
-<div class="toast" id="toast"></div>
+<h2>🖼️ Galeria</h2>
+<a href="/">🔙 Voltar</a>
+<br><br>
+<button onclick="baixarTodas()">📥 Baixar fotos desta página</button>
+<button class="btn-danger" onclick="limparSD()">🗑️ Apagar TODO o SD</button>
 
 <script>
-function showToast(msg, tempo = 2200) {
-  const toast = document.getElementById('toast');
-  toast.innerText = msg;
-  toast.style.display = 'block';
-  clearTimeout(window.__toastTimer);
-  window.__toastTimer = setTimeout(() => { toast.style.display = 'none'; }, tempo);
-}
-function mostrarModal(titulo, mensagem, botoesHTML = '', progressText = '') {
-  document.getElementById('modalTitle').innerText = titulo;
-  document.getElementById('modalMessage').innerText = mensagem;
-  const progress = document.getElementById('modalProgress');
-  if (progressText) { progress.style.display = 'block'; progress.innerText = progressText; }
-  else { progress.style.display = 'none'; progress.innerText = ''; }
-  const actions = document.getElementById('modalActions');
-  actions.innerHTML = botoesHTML || '<button onclick="fecharModal()">OK</button>';
-  document.getElementById('modalOverlay').style.display = 'flex';
-}
-function atualizarModalProgresso(txt) {
-  const p = document.getElementById('modalProgress');
-  p.style.display = 'block';
-  p.innerText = txt;
-}
-function fecharModal() { document.getElementById('modalOverlay').style.display = 'none'; }
-function confirmarAcao(titulo, mensagem, onConfirmJS) {
-  mostrarModal(
-    titulo,
-    mensagem,
-    '<button style="background:#95a5a6" onclick="fecharModal()">Cancelar</button>' +
-    '<button style="background:#e74c3c" onclick="' + onConfirmJS + '">Confirmar</button>'
-  );
-}
 function baixarFoto(nome) {
-  mostrarModal('Download iniciado', 'O navegador irá iniciar o download da foto.',
-    '<button onclick="fecharModal()">OK</button>');
-  let a = document.createElement('a');
+  const a = document.createElement('a');
   a.href = '/baixarfoto?nome=' + encodeURIComponent(nome) + '&t=' + Date.now();
   a.download = nome;
-  a.setAttribute('download', nome);
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  showToast('Download solicitado: ' + nome, 2500);
 }
+
 async function baixarTodas() {
-  let links = Array.from(document.querySelectorAll('.foto-link')).reverse();
-  if (links.length === 0) { mostrarModal('Aviso', 'Nenhuma foto disponível para baixar.'); return; }
-  const btn = document.getElementById('btnBaixarTodas');
-  btn.disabled = true;
-  btn.innerText = '⏳ Baixando...';
-  mostrarModal('Baixando fotos', 'Os downloads serão iniciados em sequência.',
-    '<button onclick="fecharModal()">Fechar</button>', 'Preparando...');
+  const links = Array.from(document.querySelectorAll('.foto-link')).reverse();
+
   for (let i = 0; i < links.length; i++) {
-    let link = links[i];
-    let nome = link.dataset.filename;
-    let href = link.dataset.href;
-    atualizarModalProgresso('Baixando ' + (i + 1) + ' de ' + links.length + ': ' + nome);
-    let a = document.createElement('a');
-    a.href = href + '&t=' + Date.now();
-    a.download = nome;
-    a.setAttribute('download', nome);
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    await new Promise(resolve => setTimeout(resolve, 900));
+    links[i].click();
+    await new Promise(r => setTimeout(r, 800));
   }
-  atualizarModalProgresso('Concluído.');
-  btn.disabled = false;
-  btn.innerText = '📥 Baixar Todas as Fotos';
-  showToast('Todos os downloads foram solicitados.', 2800);
 }
-function confirmarApagarFoto(nome) {
-  confirmarAcao('Apagar foto', 'Tem certeza que deseja apagar ' + nome + '?',
-    "executarApagarFoto('" + nome + "')");
-}
-function executarApagarFoto(nome) {
-  fecharModal();
-  showToast('Apagando ' + nome + '...');
-  fetch('/apagarfoto?nome=' + encodeURIComponent(nome) + '&t=' + Date.now(), { cache: 'no-store' })
-    .then(res => {
-      if (res.ok) {
-        showToast('Foto apagada com sucesso!');
-        setTimeout(() => { window.location.href = window.location.pathname + '?t=' + Date.now(); }, 700);
-      } else { mostrarModal('Erro', 'Não foi possível apagar a foto.'); }
-    })
-    .catch(() => mostrarModal('Erro', 'Falha de comunicação ao apagar a foto.'));
-}
-function confirmarLimparSD() {
-  confirmarAcao('Limpar cartão SD',
-    'ATENÇÃO: isso apagará todas as fotos permanentemente. Deseja continuar?',
-    'executarLimparSD()');
-}
-function executarLimparSD() {
-  fecharModal();
-  mostrarModal('Limpando cartão', 'A limpeza foi iniciada. Aguarde alguns segundos...',
-    '<button onclick="fecharModal()">Fechar</button>', 'Processando...');
-  fetch('/limparsd?t=' + Date.now(), { cache: 'no-store' })
+
+function apagarFoto(nome) {
+  if (!confirm('Apagar ' + nome + '?')) return;
+
+  fetch('/apagarfoto?nome=' + encodeURIComponent(nome) + '&t=' + Date.now())
     .then(r => {
-      if (!r.ok) throw new Error();
-      atualizarModalProgresso('Concluído.');
-      showToast('Cartão SD limpo com sucesso!');
-      setTimeout(() => { window.location.href = '/galeria?t=' + Date.now(); }, 1200);
-    })
-    .catch(() => mostrarModal('Erro', 'Falha ao limpar o cartão SD.'));
+      if (r.ok) location.reload();
+      else alert('Erro ao apagar');
+    });
+}
+
+function limparSD() {
+  if (!confirm('Apagar todas as fotos?')) return;
+
+  fetch('/limparsd?t=' + Date.now())
+    .then(r => {
+      if (r.ok) setTimeout(() => location.href = '/galeria', 1500);
+      else alert('Erro ao limpar SD');
+    });
 }
 </script>
-<div style='display:flex; flex-direction:column; align-items:center;'>
 )rawliteral";
 
 const char galeria_footer[] PROGMEM = R"rawliteral(
-</div>
-<script>
-async function carregarFotosEmLotes(lote = 3) {
-  const imgs = Array.from(document.querySelectorAll('img[data-src]'));
-  for (let i = 0; i < imgs.length; i += lote) {
-    const grupo = imgs.slice(i, i + lote);
-    await Promise.all(grupo.map(img => new Promise(resolve => {
-      img.onload = resolve;
-      img.onerror = resolve;
-      img.src = img.getAttribute('data-src');
-    })));
-  }
-}
-window.onload = function() {
-  carregarFotosEmLotes(3);
-};
-</script>
-</body></html>
+</body>
+</html>
 )rawliteral";
 
 #endif

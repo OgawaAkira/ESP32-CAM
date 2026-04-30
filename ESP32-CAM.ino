@@ -1,6 +1,6 @@
 // ============================================================
-// ESP32-CAM — Servidor Web com Galeria e Captura para SD
-// Perfil: AP estável + preview rápida dedicada para tela principal
+// ESP32-CAM — Servidor Web + API para App Android
+// Rede AP: ESP32_Camera
 // ============================================================
 
 #include <Arduino.h>
@@ -25,9 +25,10 @@
 // Globais
 // ============================================================
 static AsyncWebServer server(NetConfig::HTTP_PORT);
-static DNSServer      dnsServer;
-static TaskHandle_t   cameraTaskHandle  = nullptr;
-static TaskHandle_t   clearSdTaskHandle = nullptr;
+static DNSServer dnsServer;
+
+static TaskHandle_t cameraTaskHandle  = nullptr;
+static TaskHandle_t clearSdTaskHandle = nullptr;
 
 static SemaphoreHandle_t sdMutex = nullptr;
 
@@ -85,7 +86,11 @@ static void rotaApagarFoto(AsyncWebServerRequest* request);
 static void rotaLimparSD(AsyncWebServerRequest* request);
 static void rotaFavicon(AsyncWebServerRequest* request);
 
+static void rotaApiPing(AsyncWebServerRequest* request);
+static void rotaApiFotos(AsyncWebServerRequest* request);
+
 static void responderPortalCativo(AsyncWebServerRequest* request);
+static void responderAndroidGenerate204(AsyncWebServerRequest* request);
 static void onNotFound(AsyncWebServerRequest* request);
 static void registrarRotas();
 
@@ -106,16 +111,16 @@ static bool nomeArquivoSeguro(const String& nome) {
   if (nome.indexOf('\\') != -1) return false;
   if (nome.indexOf("..") != -1) return false;
   if (nome.indexOf(':')  != -1) return false;
+  if (!nome.endsWith(".jpg")) return false;
   return true;
 }
 
-static inline void responderErro(AsyncWebServerRequest* req, int code,
-                                 const __FlashStringHelper* msg) {
+static inline void responderErro(AsyncWebServerRequest* req, int code, const __FlashStringHelper* msg) {
   req->send(code, F("text/plain"), msg);
 }
 
 // ============================================================
-// Mutex do SD
+// Mutex SD
 // ============================================================
 static bool takeSdMutex(uint32_t timeoutMs) {
   if (!sdMutex) return false;
@@ -133,7 +138,7 @@ static bool persistirIndiceFotoLocked() {
 
   File indexFile = SD_MMC.open("/index.txt", FILE_WRITE);
   if (!indexFile) {
-    log_w("Falha ao abrir /index.txt para escrita");
+    log_w("Falha ao abrir /index.txt");
     return false;
   }
 
@@ -156,16 +161,6 @@ static void setCpuFrequencySafe(uint32_t alvoMhz) {
     return;
   }
 
-  if (atual == 80 && alvoMhz == 40) {
-    setCpuFrequencyMhz(40);
-    return;
-  }
-
-  if (atual == 40 && alvoMhz == 80) {
-    setCpuFrequencyMhz(80);
-    return;
-  }
-
   setCpuFrequencyMhz(alvoMhz);
 }
 
@@ -178,7 +173,7 @@ static void cpuModoAtivo() {
 }
 
 // ============================================================
-// Baixo consumo físico
+// Energia / Pinos
 // ============================================================
 static void aplicarEstadoBaixoConsumoPins() {
   pinMode(Pins::LED, OUTPUT);
@@ -192,15 +187,16 @@ static void aplicarEstadoBaixoConsumoPins() {
 
   if (Pins::CAM_POWER_EN != -1) {
     pinMode(Pins::CAM_POWER_EN, OUTPUT);
-    digitalWrite(Pins::CAM_POWER_EN,
-                 PowerConfig::CAM_POWER_EN_ACTIVE_HIGH ? LOW : HIGH);
+    digitalWrite(Pins::CAM_POWER_EN, PowerConfig::CAM_POWER_EN_ACTIVE_HIGH ? LOW : HIGH);
   }
 }
 
 static void energiaCamera(bool ligada) {
   if (Pins::CAM_POWER_EN != -1) {
-    digitalWrite(Pins::CAM_POWER_EN,
-                 ligada == PowerConfig::CAM_POWER_EN_ACTIVE_HIGH ? HIGH : LOW);
+    digitalWrite(
+      Pins::CAM_POWER_EN,
+      ligada == PowerConfig::CAM_POWER_EN_ACTIVE_HIGH ? HIGH : LOW
+    );
     delay(PowerConfig::CAM_POWER_SWITCH_DELAY_MS);
   }
 
@@ -219,14 +215,17 @@ static void aplicarTxPowerSeguro() {
 #if defined(WIFI_POWER_11dBm)
   if (WiFi.setTxPower(WIFI_POWER_11dBm)) return;
 #endif
+
 #if defined(WIFI_POWER_13dBm)
   if (WiFi.setTxPower(WIFI_POWER_13dBm)) return;
 #endif
+
 #if defined(WIFI_POWER_8_5dBm)
   if (WiFi.setTxPower(WIFI_POWER_8_5dBm)) return;
 #endif
+
 #if defined(WIFI_POWER_7dBm)
-  if (WiFi.setTxPower(WIFI_POWER_7dBm)) return;
+  WiFi.setTxPower(WIFI_POWER_7dBm);
 #endif
 }
 
@@ -289,6 +288,7 @@ static bool iniciarCamera() {
   config.fb_count     = 1;
 
   esp_err_t err = esp_camera_init(&config);
+
   if (err != ESP_OK) {
     delay(CamConfig::INIT_RETRY_MS);
     err = esp_camera_init(&config);
@@ -334,7 +334,7 @@ static void desligarCamera() {
 }
 
 // ============================================================
-// SD / arquivos
+// SD
 // ============================================================
 static bool encontrarUltimaFotoExistenteLocked(char* outPath, size_t outPathLen, int* outNum) {
   int start = nextPhotoNumber.load(std::memory_order_relaxed) - 1;
@@ -347,11 +347,13 @@ static bool encontrarUltimaFotoExistenteLocked(char* outPath, size_t outPathLen,
       return true;
     }
   }
+
   return false;
 }
 
 static bool inicializarSD() {
   if (!SD_MMC.begin("/sdcard", true)) {
+    Serial.println("Falha ao iniciar SD");
     return false;
   }
 
@@ -364,7 +366,7 @@ static bool inicializarSD() {
   File indexFile = SD_MMC.open("/index.txt", FILE_READ);
   if (indexFile) {
     char buf[16] = {0};
-    const size_t len = indexFile.read(reinterpret_cast<uint8_t*>(buf), sizeof(buf) - 1);
+    size_t len = indexFile.read(reinterpret_cast<uint8_t*>(buf), sizeof(buf) - 1);
     buf[len] = '\0';
     maxNum = atoi(buf);
     indexFile.close();
@@ -381,12 +383,13 @@ static bool inicializarSD() {
   }
 
   nextPhotoNumber.store(maxNum, std::memory_order_relaxed);
+
   giveSdMutex();
   return true;
 }
 
 // ============================================================
-// Preview rápida
+// Preview rápido
 // ============================================================
 static bool gerarPreviewRapidoLocked() {
   if (!PreviewConfig::ENABLE_PREVIEW_FILE) return true;
@@ -422,9 +425,9 @@ static bool gerarPreviewRapidoLocked() {
   bool ok = false;
 
   if (file) {
-    const size_t written = file.write(fbPrev->buf, fbPrev->len);
+    size_t written = file.write(fbPrev->buf, fbPrev->len);
     file.close();
-    ok = (written == fbPrev->len);
+    ok = written == fbPrev->len;
   }
 
   if (!ok) {
@@ -476,6 +479,7 @@ static void tirarFotoSalvarSD() {
       esp_camera_fb_return(fb);
       fb = nullptr;
     }
+
     cameraOcupada.store(false, std::memory_order_relaxed);
     registrarAtividadeCamera();
     cpuModoOcioso();
@@ -487,6 +491,7 @@ static void tirarFotoSalvarSD() {
   }
 
   const int photoNum = nextPhotoNumber.load(std::memory_order_relaxed);
+
   char caminho[32];
   snprintf(caminho, sizeof(caminho), "/foto_%d.jpg", photoNum);
 
@@ -497,7 +502,7 @@ static void tirarFotoSalvarSD() {
     return;
   }
 
-  const size_t written = file.write(fb->buf, fb->len);
+  size_t written = file.write(fb->buf, fb->len);
   file.close();
 
   if (written != fb->len) {
@@ -524,7 +529,7 @@ static void tirarFotoSalvarSD() {
   cleanup();
 }
 
-static void taskCamera(void* /*parameter*/) {
+static void taskCamera(void* parameter) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     tirarFotoSalvarSD();
@@ -532,9 +537,9 @@ static void taskCamera(void* /*parameter*/) {
 }
 
 // ============================================================
-// Limpeza do SD
+// Limpeza SD
 // ============================================================
-static void taskLimparSD(void* /*parameter*/) {
+static void taskLimparSD(void* parameter) {
   cpuModoAtivo();
   limpezaSD.store(true, std::memory_order_relaxed);
 
@@ -552,13 +557,15 @@ static void taskLimparSD(void* /*parameter*/) {
   }
 
   char filePath[32];
-  const int limite = nextPhotoNumber.load(std::memory_order_relaxed) + GalleryConfig::LIMITE_BUSCA_EXTRA;
+  int limite = nextPhotoNumber.load(std::memory_order_relaxed) + GalleryConfig::LIMITE_BUSCA_EXTRA;
 
   for (int i = 1; i <= limite; ++i) {
     snprintf(filePath, sizeof(filePath), "/foto_%d.jpg", i);
+
     if (SD_MMC.exists(filePath)) {
       SD_MMC.remove(filePath);
     }
+
     if ((i % 10) == 0) {
       vTaskDelay(pdMS_TO_TICKS(5));
     }
@@ -571,11 +578,13 @@ static void taskLimparSD(void* /*parameter*/) {
   SD_MMC.remove("/index.txt");
   nextPhotoNumber.store(1, std::memory_order_relaxed);
   persistirIndiceFotoLocked();
+
   giveSdMutex();
 
   limpezaSD.store(false, std::memory_order_relaxed);
   clearSdTaskHandle = nullptr;
   cpuModoOcioso();
+
   vTaskDelete(nullptr);
 }
 
@@ -584,6 +593,7 @@ static void taskLimparSD(void* /*parameter*/) {
 // ============================================================
 static void paginaInicial(AsyncWebServerRequest* request) {
   registrarAtividadeHttp();
+
   AsyncWebServerResponse* response = request->beginResponse_P(200, "text/html", index_html);
   request->send(response);
 }
@@ -600,58 +610,68 @@ static void paginaGaleria(AsyncWebServerRequest* request) {
     if (page < 0) page = 0;
   }
 
-  const int fotosPorPagina = GalleryConfig::FOTOS_POR_PAGINA;
-  const int totalFotos = nextPhotoNumber.load(std::memory_order_relaxed) - 1;
+  int fotosPorPagina = GalleryConfig::FOTOS_POR_PAGINA;
+  int totalFotos = nextPhotoNumber.load(std::memory_order_relaxed) - 1;
 
-  int fotoInicial = totalFotos - (page * fotosPorPagina);
-  int limite      = fotoInicial - fotosPorPagina + 1;
+  int fotoInicial = totalFotos - page * fotosPorPagina;
+  int limite = fotoInicial - fotosPorPagina + 1;
   if (limite < 1) limite = 1;
 
   bool temFoto = false;
-  char fileName[32];
-  char path[35];
 
-  if (fotoInicial >= 1) {
-    if (takeSdMutex(3000)) {
-      for (int i = fotoInicial; i >= limite; --i) {
-        snprintf(fileName, sizeof(fileName), "foto_%d.jpg", i);
-        snprintf(path, sizeof(path), "/%s", fileName);
+  if (fotoInicial >= 1 && takeSdMutex(3000)) {
+    char fileName[32];
+    char path[35];
 
-        if (SD_MMC.exists(path)) {
-          temFoto = true;
-          response->print(F("<div class='card'>"));
-          response->printf(
-            "<img loading='lazy' data-src='/verfoto?nome=%s&t=%lu' alt='Carregando...'>",
-            fileName, (unsigned long)millis());
-          response->print(F("<div class='card-actions'>"));
-          response->printf(
-            "<a href='javascript:void(0)' class='foto-link' data-filename='%s' "
-            "data-href='/baixarfoto?nome=%s' onclick=\"baixarFoto('%s')\">📥 Baixar</a>",
-            fileName, fileName, fileName);
-          response->printf(
-            "<button class='btn-danger' onclick=\"confirmarApagarFoto('%s')\">🗑️ Apagar</button>",
-            fileName);
-          response->print(F("</div></div>"));
-        }
+    for (int i = fotoInicial; i >= limite; --i) {
+      snprintf(fileName, sizeof(fileName), "foto_%d.jpg", i);
+      snprintf(path, sizeof(path), "/%s", fileName);
+
+      if (SD_MMC.exists(path)) {
+        temFoto = true;
+
+        response->print(F("<div class='card'>"));
+        response->printf(
+          "<img loading='lazy' src='/verfoto?nome=%s&t=%lu'>",
+          fileName,
+          (unsigned long)millis()
+        );
+
+        response->print(F("<div class='actions'>"));
+
+        response->printf(
+          "<a class='foto-link' href='javascript:baixarFoto(\"%s\")'>📥 Baixar</a>",
+          fileName
+        );
+
+        response->printf(
+          "<button class='btn-danger' onclick='apagarFoto(\"%s\")'>🗑️ Apagar</button>",
+          fileName
+        );
+
+        response->print(F("</div></div>"));
       }
-      giveSdMutex();
     }
+
+    giveSdMutex();
   }
 
   if (!temFoto) {
-    response->print(F("<p style='margin-top:20px; font-weight:bold;'>Nenhuma foto encontrada nesta página.</p>"));
+    response->print(F("<p><b>Nenhuma foto encontrada.</b></p>"));
   }
 
   if (page > 0) {
     response->printf(
-      "<button style='background-color:#34495e;' onclick=\"window.location.href='/galeria?page=%d'\">⬆️ Mais Recentes</button>",
-      page - 1);
+      "<button onclick=\"window.location.href='/galeria?page=%d'\">⬆️ Mais recentes</button>",
+      page - 1
+    );
   }
 
   if (limite > 1) {
     response->printf(
-      "<button style='background-color:#34495e;' onclick=\"window.location.href='/galeria?page=%d'\">⬇️ Mais Antigas</button>",
-      page + 1);
+      "<button onclick=\"window.location.href='/galeria?page=%d'\">⬇️ Mais antigas</button>",
+      page + 1
+    );
   }
 
   response->print(FPSTR(galeria_footer));
@@ -659,7 +679,7 @@ static void paginaGaleria(AsyncWebServerRequest* request) {
 }
 
 // ============================================================
-// API
+// API HTTP
 // ============================================================
 static void rotaCapture(AsyncWebServerRequest* request) {
   registrarAtividadeHttp();
@@ -691,14 +711,21 @@ static void rotaStatus(AsyncWebServerRequest* request) {
     return;
   }
 
-  request->send(200, F("text/plain"),
-                cameraOcupada.load(std::memory_order_relaxed) ? F("ocupada") : F("pronto"));
+  request->send(
+    200,
+    F("text/plain"),
+    cameraOcupada.load(std::memory_order_relaxed) ? F("ocupada") : F("pronto")
+  );
 }
 
 static void rotaStatusCamera(AsyncWebServerRequest* request) {
   registrarAtividadeHttp();
-  request->send(200, F("text/plain"),
-                cameraInicializada.load(std::memory_order_relaxed) ? F("ativa") : F("economia"));
+
+  request->send(
+    200,
+    F("text/plain"),
+    cameraInicializada.load(std::memory_order_relaxed) ? F("ativa") : F("economia")
+  );
 }
 
 static void rotaUltimaFoto(AsyncWebServerRequest* request) {
@@ -710,7 +737,8 @@ static void rotaUltimaFoto(AsyncWebServerRequest* request) {
   }
 
   char fileName[32];
-  const bool existe = encontrarUltimaFotoExistenteLocked(fileName, sizeof(fileName), nullptr);
+  bool existe = encontrarUltimaFotoExistenteLocked(fileName, sizeof(fileName), nullptr);
+
   giveSdMutex();
 
   if (!existe) {
@@ -719,7 +747,7 @@ static void rotaUltimaFoto(AsyncWebServerRequest* request) {
   }
 
   AsyncWebServerResponse* response =
-      request->beginResponse(SD_MMC, fileName, "image/jpeg", false);
+    request->beginResponse(SD_MMC, fileName, "image/jpeg", false);
 
   response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
   request->send(response);
@@ -734,14 +762,17 @@ static void rotaPreviewPrincipal(AsyncWebServerRequest* request) {
   }
 
   bool existePreview = false;
+
   if (PreviewConfig::ENABLE_PREVIEW_FILE) {
     existePreview = SD_MMC.exists(PreviewConfig::FILE_PATH);
   }
+
   giveSdMutex();
 
   if (existePreview) {
     AsyncWebServerResponse* response =
-        request->beginResponse(SD_MMC, PreviewConfig::FILE_PATH, "image/jpeg", false);
+      request->beginResponse(SD_MMC, PreviewConfig::FILE_PATH, "image/jpeg", false);
+
     response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     request->send(response);
     return;
@@ -758,20 +789,21 @@ static void servirArquivoSD(AsyncWebServerRequest* request, bool download) {
     return;
   }
 
-  const String param = request->getParam("nome")->value();
+  String param = request->getParam("nome")->value();
+
   if (!nomeArquivoSeguro(param)) {
     responderErro(request, 400, F("Nome invalido"));
     return;
   }
 
-  const String fileName = "/" + param;
+  String fileName = "/" + param;
 
   if (!takeSdMutex(3000)) {
     responderErro(request, 503, F("SD ocupado"));
     return;
   }
 
-  const bool existe = SD_MMC.exists(fileName);
+  bool existe = SD_MMC.exists(fileName);
   giveSdMutex();
 
   if (!existe) {
@@ -780,20 +812,24 @@ static void servirArquivoSD(AsyncWebServerRequest* request, bool download) {
   }
 
   AsyncWebServerResponse* response =
-      request->beginResponse(SD_MMC, fileName, "image/jpeg", download);
+    request->beginResponse(SD_MMC, fileName, "image/jpeg", download);
 
   response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
 
   if (download) {
-    response->addHeader("Content-Disposition",
-                        "attachment; filename=\"" + param + "\"");
+    response->addHeader("Content-Disposition", "attachment; filename=\"" + param + "\"");
   }
 
   request->send(response);
 }
 
-static void rotaVerFoto(AsyncWebServerRequest* r)    { servirArquivoSD(r, false); }
-static void rotaBaixarFoto(AsyncWebServerRequest* r) { servirArquivoSD(r, true);  }
+static void rotaVerFoto(AsyncWebServerRequest* r) {
+  servirArquivoSD(r, false);
+}
+
+static void rotaBaixarFoto(AsyncWebServerRequest* r) {
+  servirArquivoSD(r, true);
+}
 
 static void rotaApagarFoto(AsyncWebServerRequest* request) {
   registrarAtividadeHttp();
@@ -808,7 +844,8 @@ static void rotaApagarFoto(AsyncWebServerRequest* request) {
     return;
   }
 
-  const String param = request->getParam("nome")->value();
+  String param = request->getParam("nome")->value();
+
   if (!nomeArquivoSeguro(param)) {
     responderErro(request, 400, F("Nome invalido"));
     return;
@@ -819,8 +856,9 @@ static void rotaApagarFoto(AsyncWebServerRequest* request) {
     return;
   }
 
-  const String fileName = "/" + param;
-  const bool ok = SD_MMC.remove(fileName);
+  String fileName = "/" + param;
+  bool ok = SD_MMC.remove(fileName);
+
   giveSdMutex();
 
   if (ok) {
@@ -867,8 +905,107 @@ static void rotaFavicon(AsyncWebServerRequest* request) {
 }
 
 // ============================================================
+// API JSON para o app Android
+// ============================================================
+static void rotaApiPing(AsyncWebServerRequest* request) {
+  registrarAtividadeHttp();
+
+  AsyncResponseStream* response = request->beginResponseStream("application/json");
+
+  response->print(F("{"));
+  response->print(F("\"ok\":true,"));
+  response->print(F("\"ssid\":\""));
+  response->print(NetConfig::SSID);
+  response->print(F("\","));
+  response->print(F("\"status\":\""));
+
+  if (limpezaSD.load(std::memory_order_relaxed)) {
+    response->print(F("limpeza"));
+  } else if (cameraOcupada.load(std::memory_order_relaxed)) {
+    response->print(F("ocupada"));
+  } else {
+    response->print(F("pronto"));
+  }
+
+  response->print(F("\","));
+  response->print(F("\"camera\":\""));
+  response->print(cameraInicializada.load(std::memory_order_relaxed) ? F("ativa") : F("economia"));
+  response->print(F("\","));
+  response->print(F("\"next\":"));
+  response->print(nextPhotoNumber.load(std::memory_order_relaxed));
+  response->print(F("}"));
+
+  response->addHeader("Cache-Control", "no-store");
+  request->send(response);
+}
+
+static void rotaApiFotos(AsyncWebServerRequest* request) {
+  registrarAtividadeHttp();
+
+  if (!takeSdMutex(5000)) {
+    responderErro(request, 503, F("SD ocupado"));
+    return;
+  }
+
+  AsyncResponseStream* response = request->beginResponseStream("application/json");
+
+  int totalFotos = nextPhotoNumber.load(std::memory_order_relaxed) - 1;
+
+  response->print(F("{\"files\":["));
+
+  bool first = true;
+  char path[32];
+  char name[32];
+
+  for (int i = totalFotos; i >= 1; --i) {
+    snprintf(name, sizeof(name), "foto_%d.jpg", i);
+    snprintf(path, sizeof(path), "/%s", name);
+
+    if (SD_MMC.exists(path)) {
+      if (!first) response->print(F(","));
+      first = false;
+
+      response->print(F("{\"name\":\""));
+      response->print(name);
+      response->print(F("\",\"download\":\"/baixarfoto?nome="));
+      response->print(name);
+      response->print(F("\",\"view\":\"/verfoto?nome="));
+      response->print(name);
+      response->print(F("\"}"));
+    }
+
+    if ((i % 20) == 0) {
+      vTaskDelay(pdMS_TO_TICKS(2));
+    }
+  }
+
+  response->print(F("],\"next\":"));
+  response->print(nextPhotoNumber.load(std::memory_order_relaxed));
+  response->print(F("}"));
+
+  giveSdMutex();
+
+  response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  request->send(response);
+}
+
+// ============================================================
 // Captive portal
 // ============================================================
+static void responderAndroidGenerate204(AsyncWebServerRequest* request) {
+  registrarAtividadeHttp();
+
+  /*
+   * Resposta usada por Android para teste de conectividade.
+   *
+   * A rede da ESP32 não tem internet, mas responder 204 aqui pode reduzir
+   * comportamentos agressivos de captive portal em alguns aparelhos.
+   *
+   * Isso NÃO cria internet. Apenas evita redirecionar /generate_204 para HTML.
+   */
+  request->send(204);
+}
+
 static void responderPortalCativo(AsyncWebServerRequest* request) {
   registrarAtividadeHttp();
   request->redirect("http://" + WiFi.softAPIP().toString() + "/");
@@ -896,17 +1033,34 @@ static void registrarRotas() {
   server.on("/limparsd",          HTTP_GET, rotaLimparSD);
   server.on("/favicon.ico",       HTTP_GET, rotaFavicon);
 
-  static const char* portalPaths[] = {
-    "/generate_204", "/gen_204", "/fwlink",
-    "/hotspot-detect.html", "/canonical.html",
-    "/success.txt", "/success.html",
-    "/ncsi.txt", "/connecttest.txt", "/redirect",
-    "/mobile/status.php", "/library/test/success.html"
-  };
+  server.on("/api/ping",          HTTP_GET, rotaApiPing);
+  server.on("/api/fotos",         HTTP_GET, rotaApiFotos);
 
-  for (const char* p : portalPaths) {
-    server.on(p, HTTP_GET, responderPortalCativo);
-  }
+  /*
+ * Android usa /generate_204 e /gen_204 para teste de conectividade.
+ *
+ * Não redirecionamos essas rotas para HTML.
+ * Respondemos 204 para reduzir rejeições ou captive portal agressivo.
+ */
+server.on("/generate_204", HTTP_GET, responderAndroidGenerate204);
+server.on("/gen_204",      HTTP_GET, responderAndroidGenerate204);
+
+static const char* portalPaths[] = {
+  "/fwlink",
+  "/hotspot-detect.html",
+  "/canonical.html",
+  "/success.txt",
+  "/success.html",
+  "/ncsi.txt",
+  "/connecttest.txt",
+  "/redirect",
+  "/mobile/status.php",
+  "/library/test/success.html"
+};
+
+for (const char* p : portalPaths) {
+  server.on(p, HTTP_GET, responderPortalCativo);
+}
 
   server.onNotFound(onNotFound);
 }
@@ -922,6 +1076,7 @@ void setup() {
 
   sdMutex = xSemaphoreCreateMutex();
   if (!sdMutex) {
+    Serial.println("Falha ao criar mutex SD");
     return;
   }
 
@@ -947,15 +1102,29 @@ void setup() {
   );
 
   if (!apOk) {
+    Serial.println("Falha ao iniciar AP");
     return;
   }
 
   aplicarWiFiPerfilEconomia();
 
   IPAddress ip = WiFi.softAPIP();
+
+  Serial.println();
+  Serial.print("Rede Wi-Fi: ");
+  Serial.println(NetConfig::SSID);
+  Serial.print("Senha: ");
+  Serial.println(NetConfig::PASSWORD);
+  Serial.print("IP: ");
+  Serial.println(ip);
+
   dnsServer.start(NetConfig::DNS_PORT, "*", ip);
 
-  inicializarSD();
+  if (!inicializarSD()) {
+    Serial.println("SD não iniciado");
+  } else {
+    Serial.println("SD iniciado");
+  }
 
   ultimoAcessoHttp.store(millis(), std::memory_order_relaxed);
   ultimaAtividadeCamera.store(millis(), std::memory_order_relaxed);
@@ -965,7 +1134,9 @@ void setup() {
     "Cache-Control",
     "no-store, no-cache, must-revalidate, max-age=0"
   );
+
   DefaultHeaders::Instance().addHeader("Pragma", "no-cache");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
 
   registrarRotas();
   server.begin();
@@ -989,13 +1160,13 @@ void setup() {
 void loop() {
   dnsServer.processNextRequest();
 
-  const uint32_t agora = millis();
+  uint32_t agora = millis();
 
   if (PowerConfig::CAMERA_AUTO_SLEEP &&
       cameraInicializada.load(std::memory_order_relaxed) &&
       !cameraOcupada.load(std::memory_order_relaxed) &&
       !limpezaSD.load(std::memory_order_relaxed) &&
-      (agora - ultimaAtividadeCamera.load(std::memory_order_relaxed) > CamConfig::SLEEP_TIMEOUT_MS)) {
+      agora - ultimaAtividadeCamera.load(std::memory_order_relaxed) > CamConfig::SLEEP_TIMEOUT_MS) {
     desligarCamera();
     cpuModoOcioso();
   }
