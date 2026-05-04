@@ -25,7 +25,7 @@ namespace NetConfig {
 namespace CamConfig {
   constexpr uint32_t XCLK_FREQ_HZ     = 10000000;
   constexpr int      JPEG_QUALITY     = 20;
-  constexpr framesize_t FRAME_SIZE    = FRAMESIZE_QVGA;
+  constexpr framesize_t FRAME_SIZE    = FRAMESIZE_VGA;
   constexpr uint8_t  WARMUP_FRAMES    = 1;
   constexpr uint32_t WARMUP_DELAY_MS  = 20;
   constexpr uint32_t SLEEP_TIMEOUT_MS = 15000;
@@ -39,8 +39,8 @@ namespace CamConfig {
 namespace PreviewConfig {
   constexpr bool ENABLE_PREVIEW_FILE  = true;
   constexpr const char* FILE_PATH     = "/preview.jpg";
-  constexpr framesize_t FRAME_SIZE    = FRAMESIZE_QQVGA;
-  constexpr int JPEG_QUALITY          = 30;
+  constexpr framesize_t FRAME_SIZE    = FRAMESIZE_VGA;
+  constexpr int JPEG_QUALITY          = 10;
   constexpr uint8_t  WARMUP_FRAMES    = 1;
   constexpr uint32_t WARMUP_DELAY_MS  = 15;
   constexpr uint32_t SETTLE_DELAY_MS  = 15;
